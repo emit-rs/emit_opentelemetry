@@ -3,6 +3,8 @@ Integrate `emit` with the OpenTelemetry SDK.
 
 This library forwards diagnostic events from `emit` through the OpenTelemetry SDK as log records and spans. This library is for applications that already use the OpenTelemetry SDK. It's also intended for applications that need to unify multiple instrumentation libraries, like `emit`, `log`, and `tracing`, into a shared pipeline. If you'd just like to send `emit` diagnostics via OTLP to the OpenTelemetry Collector or other compatible service, then consider [`emit_otlp`](https://docs.rs/emit_otlp).
 
+`emit_opentelemetry` version `x.y.z` is compatible with `opentelemetry_sdk` version `x.y.*`.
+
 # Getting started
 
 Configure the OpenTelemetry SDK as per its documentation, then add `emit` and `emit_opentelemetry` to your Cargo.toml:
@@ -12,7 +14,7 @@ Configure the OpenTelemetry SDK as per its documentation, then add `emit` and `e
 version = "0.11"
 
 [dependencies.emit_opentelemetry]
-version = "0.26.1"
+version = "0.27.0"
 ```
 
 Initialize `emit` to send diagnostics to the OpenTelemetry SDK using [`setup`]:
@@ -198,7 +200,7 @@ where
     emit::setup()
         .emit_to(OpenTelemetryEmitter::new(
             metrics.clone(),
-            logger_provider.logger_builder(name).build(),
+            logger_provider.logger(name),
         ))
         .emit_when(OpenTelemetryIsSampledFilter {})
         .map_ctxt(|ctxt| {
@@ -747,9 +749,7 @@ fn otel_span_value(v: emit::Value) -> Option<Value> {
             AnyValue::String(v) => Some(Value::String(v)),
             AnyValue::Boolean(v) => Some(Value::Bool(v)),
             // Variants not supported by `Value`
-            AnyValue::Bytes(_) => Some(Value::String(v.to_string().into())),
-            AnyValue::ListAny(_) => Some(Value::String(v.to_string().into())),
-            AnyValue::Map(_) => Some(Value::String(v.to_string().into())),
+            _ => Some(Value::String(v.to_string().into())),
         },
         Ok(None) => None,
         Err(()) => Some(Value::String(v.to_string().into())),
@@ -1234,19 +1234,19 @@ mod tests {
 
     use opentelemetry_sdk::{
         logs::LoggerProvider,
-        testing::{logs::InMemoryLogsExporter, trace::InMemorySpanExporter},
+        testing::{logs::in_memory_exporter::InMemoryLogExporter, trace::InMemorySpanExporter},
         trace::TracerProvider,
     };
 
     fn build(
         slot: &AmbientSlot,
     ) -> (
-        InMemoryLogsExporter,
+        InMemoryLogExporter,
         InMemorySpanExporter,
         LoggerProvider,
         TracerProvider,
     ) {
-        let logger_exporter = InMemoryLogsExporter::default();
+        let logger_exporter = InMemoryLogExporter::default();
 
         let logger_provider = LoggerProvider::builder()
             .with_simple_exporter(logger_exporter.clone())

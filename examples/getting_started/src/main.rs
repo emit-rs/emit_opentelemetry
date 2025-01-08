@@ -4,6 +4,9 @@ This example demonstrates configuring `emit` to forward its events through the O
 This is useful if you're already using the OpenTelemtry SDK, or if your application uses multiple frameworks.
 */
 
+use opentelemetry_otlp::WithTonicConfig;
+use opentelemetry_sdk::runtime::Tokio;
+
 #[tokio::main]
 async fn main() {
     // Configure the OpenTelemetry SDK
@@ -13,25 +16,25 @@ async fn main() {
         .await
         .unwrap();
 
-    let tracer_provider = opentelemetry_otlp::new_pipeline()
-        .tracing()
-        .with_exporter(
-            opentelemetry_otlp::new_exporter()
-                .tonic()
-                .with_channel(channel.clone()),
-        )
-        .install_batch(opentelemetry_sdk::runtime::Tokio)
+    let trace_exporter = opentelemetry_otlp::SpanExporter::builder()
+        .with_tonic()
+        .with_channel(channel.clone())
+        .build()
         .unwrap();
 
-    let logger_provider = opentelemetry_otlp::new_pipeline()
-        .logging()
-        .with_exporter(
-            opentelemetry_otlp::new_exporter()
-                .tonic()
-                .with_channel(channel.clone()),
-        )
-        .install_batch(opentelemetry_sdk::runtime::Tokio)
+    let tracer_provider = opentelemetry_sdk::trace::TracerProvider::builder()
+        .with_batch_exporter(trace_exporter, Tokio)
+        .build();
+
+    let log_exporter = opentelemetry_otlp::LogExporter::builder()
+        .with_tonic()
+        .with_channel(channel.clone())
+        .build()
         .unwrap();
+
+    let logger_provider = opentelemetry_sdk::logs::LoggerProvider::builder()
+        .with_batch_exporter(log_exporter, Tokio)
+        .build();
 
     // Configure `emit` to point to `opentelemetry`
     let _ = emit_opentelemetry::setup(logger_provider.clone(), tracer_provider.clone()).init();
