@@ -9,10 +9,10 @@ Configure the OpenTelemetry SDK as per its documentation, then add `emit` and `e
 
 ```toml
 [dependencies.emit]
-version = "0.26.0"
+version = "0.11"
 
 [dependencies.emit_opentelemetry]
-version = "0.26.0"
+version = "0.26.1"
 ```
 
 Initialize `emit` to send diagnostics to the OpenTelemetry SDK using [`setup`]:
