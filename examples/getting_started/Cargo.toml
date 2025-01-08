@@ -1,12 +1,12 @@
 [package]
 name = "emit_example_opentelemetry_getting_started"
-version = "0.11.0-alpha.21"
+version = "0.26.0"
 authors = ["emit contributors"]
 edition = "2021"
 publish = false
 
 [dependencies.emit]
-git = "https://github.com/emit-rs/emit"
+version = "0.11"
 
 [dependencies.emit_opentelemetry]
 path = "../../"

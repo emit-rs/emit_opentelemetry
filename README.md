@@ -2,7 +2,7 @@
 
 [![opentelemetry](https://github.com/emit-rs/emit_opentelemetry/actions/workflows/opentelemetry.yml/badge.svg)](https://github.com/emit-rs/emit_opentelemetry/actions/workflows/opentelemetry.yml)
 
-[Current docs](https://docs.rs/emit_opentelemetry/0.11.0-alpha.21/emit_opentelemetry/index.html)
+[Current docs](https://docs.rs/emit_opentelemetry/0.26.0/emit_opentelemetry/index.html)
 
 Integrate `emit` with the OpenTelemetry SDK.
 
