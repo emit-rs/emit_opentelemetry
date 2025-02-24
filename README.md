@@ -2,7 +2,7 @@
 
 [![opentelemetry](https://github.com/emit-rs/emit_opentelemetry/actions/workflows/opentelemetry.yml/badge.svg)](https://github.com/emit-rs/emit_opentelemetry/actions/workflows/opentelemetry.yml)
 
-[Current docs](https://docs.rs/emit_opentelemetry/0.28.0/emit_opentelemetry/index.html)
+[Current docs](https://docs.rs/emit_opentelemetry/0.28.1/emit_opentelemetry/index.html)
 
 Integrate `emit` with the OpenTelemetry SDK.
 
@@ -17,7 +17,7 @@ Configure the OpenTelemetry SDK as per its documentation, then add `emit` and `e
 version = "1"
 
 [dependencies.emit_opentelemetry]
-version = "0.28.0"
+version = "0.28.1"
 ```
 
 Initialize `emit` to send diagnostics to the OpenTelemetry SDK using the `emit_opentelemetry::setup` function:
