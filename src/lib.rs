@@ -23,11 +23,11 @@ Initialize `emit` to send diagnostics to the OpenTelemetry SDK using [`setup`]:
 fn main() {
     // Configure the OpenTelemetry SDK
     // See the OpenTelemetry SDK docs for details on configuration
-    let logger_provider = opentelemetry_sdk::logs::LoggerProvider::builder()
+    let logger_provider = opentelemetry_sdk::logs::SdkLoggerProvider::builder()
         .with_simple_exporter(opentelemetry_stdout::LogExporter::default())
         .build();
 
-    let tracer_provider = opentelemetry_sdk::trace::TracerProvider::builder()
+    let tracer_provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
         .with_simple_exporter(opentelemetry_stdout::SpanExporter::default())
         .build();
 
@@ -67,11 +67,11 @@ If you're not seeing `emit` diagnostics flow as expected through the OpenTelemet
 use emit::metric::Source;
 
 fn main() {
-    let logger_provider = opentelemetry_sdk::logs::LoggerProvider::builder()
+    let logger_provider = opentelemetry_sdk::logs::SdkLoggerProvider::builder()
         .with_simple_exporter(opentelemetry_stdout::LogExporter::default())
         .build();
 
-    let tracer_provider = opentelemetry_sdk::trace::TracerProvider::builder()
+    let tracer_provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
         .with_simple_exporter(opentelemetry_stdout::SpanExporter::default())
         .build();
 
@@ -136,11 +136,11 @@ Start a builder for the `emit` to OpenTelemetry SDK integration.
 fn main() {
     // Configure the OpenTelemetry SDK
     // See the OpenTelemetry SDK docs for details on configuration
-    let logger_provider = opentelemetry_sdk::logs::LoggerProvider::builder()
+    let logger_provider = opentelemetry_sdk::logs::SdkLoggerProvider::builder()
         .with_simple_exporter(opentelemetry_stdout::LogExporter::default())
         .build();
 
-    let tracer_provider = opentelemetry_sdk::trace::TracerProvider::builder()
+    let tracer_provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
         .with_simple_exporter(opentelemetry_stdout::SpanExporter::default())
         .build();
 
@@ -160,11 +160,11 @@ Use [`emit::Setup::map_emitter`] and [`emit::Setup::map_ctxt`] on the returned v
 fn main() {
     // Configure the OpenTelemetry SDK
     // See the OpenTelemetry SDK docs for details on configuration
-    let logger_provider = opentelemetry_sdk::logs::LoggerProvider::builder()
+    let logger_provider = opentelemetry_sdk::logs::SdkLoggerProvider::builder()
         .with_simple_exporter(opentelemetry_stdout::LogExporter::default())
         .build();
 
-    let tracer_provider = opentelemetry_sdk::trace::TracerProvider::builder()
+    let tracer_provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
         .with_simple_exporter(opentelemetry_stdout::SpanExporter::default())
         .build();
 
@@ -1233,9 +1233,8 @@ mod tests {
     use opentelemetry::trace::{SamplingDecision, SamplingResult, TraceState};
 
     use opentelemetry_sdk::{
-        logs::LoggerProvider,
-        testing::{logs::in_memory_exporter::InMemoryLogExporter, trace::InMemorySpanExporter},
-        trace::TracerProvider,
+        logs::{in_memory_exporter::InMemoryLogExporter, SdkLoggerProvider},
+        trace::{in_memory_exporter::InMemorySpanExporter, SdkTracerProvider},
     };
 
     fn build(
@@ -1243,18 +1242,18 @@ mod tests {
     ) -> (
         InMemoryLogExporter,
         InMemorySpanExporter,
-        LoggerProvider,
-        TracerProvider,
+        SdkLoggerProvider,
+        SdkTracerProvider,
     ) {
         let logger_exporter = InMemoryLogExporter::default();
 
-        let logger_provider = LoggerProvider::builder()
+        let logger_provider = SdkLoggerProvider::builder()
             .with_simple_exporter(logger_exporter.clone())
             .build();
 
         let tracer_exporter = InMemorySpanExporter::default();
 
-        let tracer_provider = TracerProvider::builder()
+        let tracer_provider = SdkTracerProvider::builder()
             .with_simple_exporter(tracer_exporter.clone())
             .build();
 
@@ -1279,7 +1278,7 @@ mod tests {
 
         assert_eq!(1, logs.len());
 
-        let Some(AnyValue::String(ref body)) = logs[0].record.body else {
+        let Some(AnyValue::String(body)) = logs[0].record.body() else {
             panic!("unexpected log body value");
         };
 
@@ -1347,7 +1346,7 @@ mod tests {
         let (_, spans, _, tracer_provider) = build(&SLOT);
 
         fn otel_span(
-            tracer_provider: &TracerProvider,
+            tracer_provider: &SdkTracerProvider,
         ) -> (opentelemetry::trace::SpanContext, emit::span::SpanCtxt) {
             use opentelemetry::trace::TracerProvider;
 
@@ -1416,9 +1415,9 @@ mod tests {
 
         #[emit::span(rt: SLOT.get(), "emit span")]
         fn emit_span(
-            tracer_provider: &TracerProvider,
+            tracer_provider: &SdkTracerProvider,
         ) -> (opentelemetry::trace::SpanContext, emit::span::SpanCtxt) {
-            fn otel_span(tracer_provider: &TracerProvider) -> opentelemetry::trace::SpanContext {
+            fn otel_span(tracer_provider: &SdkTracerProvider) -> opentelemetry::trace::SpanContext {
                 use opentelemetry::trace::TracerProvider;
 
                 tracer_provider
@@ -1476,7 +1475,7 @@ mod tests {
         static SLOT: AmbientSlot = AmbientSlot::new();
         let (logs, _, _, tracer_provider) = build(&SLOT);
 
-        fn otel_span(tracer_provider: &TracerProvider) -> opentelemetry::trace::SpanContext {
+        fn otel_span(tracer_provider: &SdkTracerProvider) -> opentelemetry::trace::SpanContext {
             use opentelemetry::trace::TracerProvider;
 
             tracer_provider
@@ -1496,11 +1495,11 @@ mod tests {
 
         assert_eq!(
             ctxt.trace_id(),
-            logs[0].record.trace_context.as_ref().unwrap().trace_id
+            logs[0].record.trace_context().unwrap().trace_id
         );
         assert_eq!(
             ctxt.span_id(),
-            logs[0].record.trace_context.as_ref().unwrap().span_id
+            logs[0].record.trace_context().unwrap().span_id
         );
     }
 
@@ -1514,7 +1513,7 @@ mod tests {
             emit::emit!(rt: SLOT.get(), "emit event");
         }
 
-        fn otel_span(tracer_provider: &TracerProvider) {
+        fn otel_span(tracer_provider: &SdkTracerProvider) {
             use opentelemetry::trace::TracerProvider;
 
             let tracer = tracer_provider.tracer("otel_span");
@@ -1549,7 +1548,7 @@ mod tests {
         let (logs, _, logger_provider, _) = build(&SLOT);
 
         #[emit::span(rt: SLOT.get(), "emit span")]
-        fn emit_span(logger_provider: &LoggerProvider) -> emit::span::SpanCtxt {
+        fn emit_span(logger_provider: &SdkLoggerProvider) -> emit::span::SpanCtxt {
             use opentelemetry::logs::LoggerProvider;
 
             let logger = logger_provider.logger("otel_logger");
@@ -1571,23 +1570,11 @@ mod tests {
 
         assert_eq!(
             ctxt.trace_id().unwrap().to_bytes(),
-            logs[0]
-                .record
-                .trace_context
-                .as_ref()
-                .unwrap()
-                .trace_id
-                .to_bytes()
+            logs[0].record.trace_context().unwrap().trace_id.to_bytes()
         );
         assert_eq!(
             ctxt.span_id().unwrap().to_bytes(),
-            logs[0]
-                .record
-                .trace_context
-                .as_ref()
-                .unwrap()
-                .span_id
-                .to_bytes()
+            logs[0].record.trace_context().unwrap().span_id.to_bytes()
         );
     }
 

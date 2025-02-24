@@ -5,7 +5,6 @@ This is useful if you're already using the OpenTelemtry SDK, or if your applicat
 */
 
 use opentelemetry_otlp::WithTonicConfig;
-use opentelemetry_sdk::runtime::Tokio;
 
 #[tokio::main]
 async fn main() {
@@ -22,8 +21,8 @@ async fn main() {
         .build()
         .unwrap();
 
-    let tracer_provider = opentelemetry_sdk::trace::TracerProvider::builder()
-        .with_batch_exporter(trace_exporter, Tokio)
+    let tracer_provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+        .with_batch_exporter(trace_exporter)
         .build();
 
     let log_exporter = opentelemetry_otlp::LogExporter::builder()
@@ -32,8 +31,8 @@ async fn main() {
         .build()
         .unwrap();
 
-    let logger_provider = opentelemetry_sdk::logs::LoggerProvider::builder()
-        .with_batch_exporter(log_exporter, Tokio)
+    let logger_provider = opentelemetry_sdk::logs::SdkLoggerProvider::builder()
+        .with_batch_exporter(log_exporter)
         .build();
 
     // Configure `emit` to point to `opentelemetry`
