@@ -1,6 +1,6 @@
 [package]
 name = "emit_opentelemetry"
-version = "0.28.1"
+version = "0.29.0"
 authors = ["emit contributors"]
 license = "MIT OR Apache-2.0"
 readme = "README.md"
@@ -21,11 +21,11 @@ features = ["std", "serde", "implicit_internal_rt"]
 default-features = false
 
 [dependencies.opentelemetry_sdk]
-version = "0.28"
+version = "0.29"
 features = ["logs", "trace"]
 
 [dependencies.opentelemetry]
-version = "0.28"
+version = "0.29"
 features = ["logs", "trace"]
 
 [dependencies.serde]
@@ -36,9 +36,13 @@ version = "1"
 features = ["implicit_rt"]
 
 [dev-dependencies.opentelemetry_sdk]
-version = "0.28"
+version = "0.29"
 features = ["logs", "trace", "testing"]
 
 [dev-dependencies.opentelemetry-stdout]
-version = "0.28"
+version = "0.29"
 features = ["logs", "trace"]
+
+[dev-dependencies.serde]
+version = "1"
+features = ["derive"]
