@@ -16,8 +16,17 @@ Configure the OpenTelemetry SDK as per its documentation, then add `emit` and `e
 [dependencies.emit]
 version = "1"
 
+# add `emit_openetelemetry` with the same major/minor as the OpenTelemetry SDK
 [dependencies.emit_opentelemetry]
-version = "0.28.1"
+version = "0.29"
+
+[dependencies.opentelemetry_sdk]
+version = "0.29"
+features = ["trace", "logs"]
+
+[dependencies.opentelemetry]
+version = "0.29"
+features = ["trace", "logs"]
 ```
 
 Initialize `emit` to send diagnostics to the OpenTelemetry SDK using the `emit_opentelemetry::setup` function:
