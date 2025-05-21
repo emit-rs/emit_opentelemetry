@@ -53,9 +53,26 @@ fn main() {
 
 Diagnostic events produced by the [`macro@emit::span`] macro are sent to an [`opentelemetry::trace::Tracer`] as an [`opentelemetry::trace::Span`] on completion. All other emitted events are sent to an [`opentelemetry::logs::Logger`] as [`opentelemetry::logs::LogRecord`]s.
 
+# Mapping
+
+`emit` events are mapped into the OpenTelemetry data model as follows:
+
+- When [`emit::Ctxt::open_push`] is called, which is done at the start of functions annotated with `#[emit::span]`, a span is created in the configured [`opentelemetry::trace::TracerProvider`].
+  - If the properties include a `span_name` then it will be used as the name of the created span, otherwise `emit_span` will be used unil the span is emitted.
+  - If the properties include a `span_kind` then it will be used as the kind of the created span.
+- When [`emit::Emitter::emit`] is called, which is done at the end of functions annotated with `#[emit::span]`, then the `emit` event will be mapped to either an OpenTelemetry log record or span.
+  - If the event has a span id and it matches the currently active span in the OpenTelemetry context then it will be completed as a span.
+    - If the span doesn't have a meaningful name configured already, then the rendered message will be used.
+    - If the `emit` event contains the well-known `err` property, it will be mapped onto the semantic `exception` event on the span, and the span's status will be set to `Error`.
+    - If the `emit` event contains the well-known `lvl` property, and its value is `error`, the span's status will be set to `Error`.
+  - If the event isn't for a span, then it will be emitted as a log record. `emit` events aren't ever added as events on OpenTelemetry spans.
+  - Properties on the `emit` event are mapped onto attributes on the resulting OpenTelemetry item.
+
 # Sampling
 
-By default, `emit` events will be excluded if they are inside an unsampled OpenTelemetry trace, even if that trace is marked as recorded. You can change this behavior by overriding the filter using [`emit::Setup::emit_when`] on the value returned by [`setup`].
+By default, `emit` events will be excluded if they are inside an unsampled OpenTelemetry trace, even if that trace is marked as recorded. OpenTelemetry will still propagate sampling decisions, but `emit`'s own spans will not be constructed within the unsampled trace.
+
+You can change this behavior by overriding the filter using [`emit::Setup::emit_when`] on the value returned by [`setup`].
 
 # Limitations
 
@@ -118,19 +135,21 @@ Also see the [`opentelemetry`] docs for any details on getting diagnostics out o
 #![doc(html_logo_url = "https://raw.githubusercontent.com/emit-rs/emit/main/asset/logo.svg")]
 #![deny(missing_docs)]
 
-use std::{cell::RefCell, fmt, ops::ControlFlow, sync::Arc};
+use std::{borrow::Cow, cell::RefCell, fmt, ops::ControlFlow, sync::Arc};
 
 use emit::{
     well_known::{
-        KEY_ERR, KEY_EVT_KIND, KEY_LVL, KEY_SPAN_ID, KEY_SPAN_NAME, KEY_SPAN_PARENT, KEY_TRACE_ID,
-        LVL_DEBUG, LVL_ERROR, LVL_INFO, LVL_WARN,
+        KEY_ERR, KEY_EVT_KIND, KEY_LVL, KEY_SPAN_ID, KEY_SPAN_KIND, KEY_SPAN_NAME, KEY_SPAN_PARENT,
+        KEY_TRACE_ID, LVL_DEBUG, LVL_ERROR, LVL_INFO, LVL_WARN,
     },
     Filter, Props,
 };
 
 use opentelemetry::{
     logs::{AnyValue, LogRecord, Logger, LoggerProvider, Severity},
-    trace::{SpanContext, SpanId, Status, TraceContextExt, TraceId, Tracer, TracerProvider},
+    trace::{
+        SpanContext, SpanId, SpanKind, Status, TraceContextExt, TraceId, Tracer, TracerProvider,
+    },
     Context, ContextGuard, Key, KeyValue, Value,
 };
 
@@ -336,8 +355,8 @@ where
     type Frame = OpenTelemetryFrame<C::Frame>;
 
     fn open_root<P: emit::Props>(&self, props: P) -> Self::Frame {
-        let trace_id = props.pull::<emit::TraceId, _>(emit::well_known::KEY_TRACE_ID);
-        let span_id = props.pull::<emit::SpanId, _>(emit::well_known::KEY_SPAN_ID);
+        let trace_id = props.pull::<emit::TraceId, _>(KEY_TRACE_ID);
+        let span_id = props.pull::<emit::SpanId, _>(KEY_SPAN_ID);
 
         // Only open a span if the props include a span id
         if let Some(span_id) = span_id {
@@ -347,9 +366,29 @@ where
 
             // Only open a span if the id has changed
             if span_id != ctxt.span().span_context().span_id() {
+                let span_kind = props
+                    .pull::<emit::span::SpanKind, _>(KEY_SPAN_KIND)
+                    .map(|kind| match kind {
+                        emit::span::SpanKind::Client => SpanKind::Client,
+                        emit::span::SpanKind::Server => SpanKind::Server,
+                        emit::span::SpanKind::Producer => SpanKind::Producer,
+                        emit::span::SpanKind::Consumer => SpanKind::Consumer,
+                        _ => SpanKind::Internal,
+                    })
+                    .unwrap_or(SpanKind::Internal);
+
+                let span_name = props
+                    .pull::<String, _>(KEY_SPAN_NAME)
+                    .map(Cow::Owned)
+                    .unwrap_or(Cow::Borrowed("emit_span"));
+
                 let trace_id = trace_id.map(otel_trace_id);
 
-                let mut span = self.tracer.span_builder("emit_span").with_span_id(span_id);
+                let mut span = self
+                    .tracer
+                    .span_builder(span_name)
+                    .with_kind(span_kind)
+                    .with_span_id(span_id);
 
                 if let Some(trace_id) = trace_id {
                     span = span.with_trace_id(trace_id);
@@ -571,20 +610,17 @@ impl<L: Logger> emit::Emitter for OpenTelemetryEmitter<L> {
 
                     // If the event is for the current span then complete it
                     if Some(span_id) == evt_span_id {
-                        let name = format!(
-                            "{}",
-                            MessageRenderer {
-                                fmt: &self.span_name,
-                                evt: &evt,
-                            }
-                        );
+                        let mut new_span_name = None;
+                        let mut status = Status::Ok;
+                        let mut status_is_descriptive_err = false;
 
-                        span.update_name(name);
-
-                        evt.props().for_each(|k, v| {
+                        let _ = evt.props().for_each(|k, v| {
                             if k == KEY_LVL {
                                 if let Some(emit::Level::Error) = v.by_ref().cast::<emit::Level>() {
-                                    span.set_status(Status::error("error"));
+                                    // Only set the status if we haven't given it a more descriptive value already
+                                    if !status_is_descriptive_err {
+                                        status = Status::error("error");
+                                    }
 
                                     return ControlFlow::Continue(());
                                 }
@@ -596,14 +632,22 @@ impl<L: Logger> emit::Emitter for OpenTelemetryEmitter<L> {
                                     vec![KeyValue::new("exception.message", v.to_string())],
                                 );
 
+                                status = Status::error(v.to_string());
+                                status_is_descriptive_err = true;
+
                                 return ControlFlow::Continue(());
                             }
 
+                            if k == KEY_SPAN_NAME {
+                                new_span_name = Some(v.to_string());
+                            }
+
+                            // Ignored
                             if k == KEY_TRACE_ID
                                 || k == KEY_SPAN_ID
                                 || k == KEY_SPAN_PARENT
-                                || k == KEY_SPAN_NAME
                                 || k == KEY_EVT_KIND
+                                || k == KEY_SPAN_KIND
                             {
                                 return ControlFlow::Continue(());
                             }
@@ -614,6 +658,17 @@ impl<L: Logger> emit::Emitter for OpenTelemetryEmitter<L> {
 
                             ControlFlow::Continue(())
                         });
+
+                        let name = new_span_name.unwrap_or_else(|| {
+                            MessageRenderer {
+                                fmt: &self.span_name,
+                                evt: &evt,
+                            }
+                            .to_string()
+                        });
+
+                        span.update_name(name);
+                        span.set_status(status);
 
                         if let Some(extent) = evt.extent().and_then(|ex| ex.as_range()) {
                             span.end_with_timestamp(extent.end.to_system_time());
@@ -651,7 +706,7 @@ impl<L: Logger> emit::Emitter for OpenTelemetryEmitter<L> {
         let mut span_id = None;
         let mut attributes = Vec::new();
         {
-            evt.props().for_each(|k, v| {
+            let _ = evt.props().for_each(|k, v| {
                 if k == KEY_LVL {
                     match v.by_ref().cast::<emit::Level>() {
                         Some(emit::Level::Debug) => {
@@ -1235,6 +1290,8 @@ mod any_value {
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+
     use super::*;
 
     use emit::runtime::AmbientSlot;
@@ -1477,6 +1534,97 @@ mod tests {
             spans[1].span_context.span_id().to_bytes()
         );
         assert!(emit_ctxt.span_parent().is_none());
+    }
+
+    #[test]
+    fn emit_span_span_name() {
+        static SLOT: AmbientSlot = AmbientSlot::new();
+        let (_, spans, _, _) = build(&SLOT);
+
+        #[emit::span(rt: SLOT.get(), "emit span", span_name: "custom name")]
+        fn emit_span() {}
+
+        emit_span();
+
+        let spans = spans.get_finished_spans().unwrap();
+
+        assert_eq!(1, spans.len());
+
+        assert_eq!("custom name", spans[0].name);
+    }
+
+    #[test]
+    fn emit_span_span_kind() {
+        static SLOT: AmbientSlot = AmbientSlot::new();
+        let (_, spans, _, _) = build(&SLOT);
+
+        #[emit::span(rt: SLOT.get(), "emit span", span_kind: "producer")]
+        fn emit_span() {}
+
+        emit_span();
+
+        let spans = spans.get_finished_spans().unwrap();
+
+        assert_eq!(1, spans.len());
+
+        assert_eq!(SpanKind::Producer, spans[0].span_kind);
+    }
+
+    #[test]
+    fn emit_span_ok() {
+        static SLOT: AmbientSlot = AmbientSlot::new();
+        let (_, spans, _, _) = build(&SLOT);
+
+        #[emit::span(rt: SLOT.get(), ok_lvl: "info", "emit span")]
+        fn emit_span() -> Result<(), io::Error> {
+            Ok(())
+        }
+
+        let _ = emit_span();
+
+        let spans = spans.get_finished_spans().unwrap();
+
+        assert_eq!(1, spans.len());
+
+        assert_eq!(Status::Ok, spans[0].status);
+    }
+
+    #[test]
+    fn emit_span_err() {
+        static SLOT: AmbientSlot = AmbientSlot::new();
+        let (_, spans, _, _) = build(&SLOT);
+
+        #[emit::span(rt: SLOT.get(), err_lvl: "error", "emit span")]
+        fn emit_span() -> Result<(), io::Error> {
+            Err(io::Error::new(io::ErrorKind::Other, "something failed!"))
+        }
+
+        let _ = emit_span();
+
+        let spans = spans.get_finished_spans().unwrap();
+
+        assert_eq!(1, spans.len());
+
+        assert_eq!(Status::error("something failed!"), spans[0].status);
+    }
+
+    #[test]
+    fn emit_span_lvl_err() {
+        static SLOT: AmbientSlot = AmbientSlot::new();
+        let (_, spans, _, _) = build(&SLOT);
+
+        #[emit::span(rt: SLOT.get(), ok_lvl: "error", "emit span")]
+        fn emit_span() -> Result<(), io::Error> {
+            Ok(())
+        }
+
+        let _ = emit_span();
+
+        let spans = spans.get_finished_spans().unwrap();
+
+        assert_eq!(1, spans.len());
+
+        assert_eq!(Status::error("error"), spans[0].status);
     }
 
     #[test]
