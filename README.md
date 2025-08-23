@@ -4,7 +4,7 @@
 
 [Current docs](https://docs.rs/emit_opentelemetry/0.28.1/emit_opentelemetry/index.html)
 
-Integrate `emit` with the OpenTelemetry SDK.
+Integrate [`emit`](https://github.com/emit-rs/emit) with the OpenTelemetry SDK.
 
 This library forwards diagnostic events from emit through the OpenTelemetry SDK as log records and spans.
 
@@ -55,6 +55,8 @@ fn main() {
 ```
 
 This function accepts a [`LoggerProvider`](https://docs.rs/opentelemetry/0.28/opentelemetry/logs/trait.LoggerProvider.html) and [`TracerProvider`](https://docs.rs/opentelemetry/0.28/opentelemetry/trace/trait.TracerProvider.html) from the OpenTelemetry SDK to forward `emit` events to.
+
+For more details on how to use `emit` once you've initialized it, see [the guide](https://emit-rs.io), or [examples in the main `emit` repository](https://github.com/emit-rs/emit/tree/main/examples).
 
 ## Versioning and compatibility
 
