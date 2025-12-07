@@ -59,14 +59,14 @@ fn run_emit() {
     emit::info!("Counted up to {counter}");
 
     // Emit a metric sample
-    emit::runtime::shared().emit(emit::Metric::new(
-        emit::mdl!(),
-        "counter",
-        emit::well_known::METRIC_AGG_COUNT,
-        emit::Empty,
-        counter,
-        emit::Empty,
-    ));
+    //
+    // NOTE: This sample will be emitted as a log, not a metric.
+    // To send `emit`'s metrics via the OpenTelemetry SDK, you'll
+    // need to use `emit_otlp` instead.
+    //
+    // You can still use `emit` for logs and traces, and just use the
+    // OpenTelemetry SDK for your metrics.
+    emit::count_sample!(value: counter);
 }
 
 fn run_opentelemetry<T: opentelemetry::trace::TracerProvider>(tracer_provider: T)
