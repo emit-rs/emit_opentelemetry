@@ -7,8 +7,10 @@
 Integrate [`emit`](https://github.com/emit-rs/emit) with the OpenTelemetry SDK.
 
 This library forwards diagnostic events from emit through the OpenTelemetry SDK as log records and spans.
-It lets you use `emit`'s ergonomic developer-oriented APIs in your OpenTelemetry-instrumented applications.
-See [the guide](https://emit-rs.io) for more details on using `emit`.
+It lets you use `emit`'s ergonomic developer-oriented API in your OpenTelemetry-instrumented applications.
+It's also ideal for applications integrating multiple frameworks together, using the OpenTelemetry SDK as a common target.
+
+See [the guide](https://emit-rs.io) for more details on using `emit` itself.
 
 ## Getting started
 
@@ -52,11 +54,35 @@ fn main() {
 
     rt.blocking_flush(std::time::Duration::from_secs(30));
 
-    // Shutdown the OpenTelemetry SDK
+    // Shutdown the SDK
+    let _ = logger_provider.shutdown();
+    let _ = tracer_provider.shutdown();
 }
 ```
 
 This function accepts a [`LoggerProvider`](https://docs.rs/opentelemetry/0.28/opentelemetry/logs/trait.LoggerProvider.html) and [`TracerProvider`](https://docs.rs/opentelemetry/0.28/opentelemetry/trace/trait.TracerProvider.html) from the OpenTelemetry SDK to forward `emit` events to.
+
+## Logging
+
+Events emitted with `emit` will be mapped into OpenTelemetry log records:
+
+```rust
+let user = "Rust";
+
+// This event will be emitted to the OpenTelemetry `LoggerProvider`
+emit::info!("hello, {user}!");
+```
+
+## Tracing
+
+Functions annotated with `emit` will be mapped into OpenTelemetry spans, with trace context managed by the OpenTelemetry SDK:
+
+```rust
+#[emit::span("instrumented function")]
+fn instrumented_fn() {
+    // Within the body of this function, the OpenTelemetry `Context` will carry the trace context computed by the `#[emit::span]` macro
+}
+```
 
 For more details on how to use `emit` once you've initialized it, see [the guide](https://emit-rs.io), or [examples in the main `emit` repository](https://github.com/emit-rs/emit/tree/main/examples).
 

@@ -54,7 +54,8 @@ fn main() {
 }
 ```
 
-Diagnostic events produced by the [`macro@emit::span`] macro are sent to an [`opentelemetry::trace::Tracer`] as an [`opentelemetry::trace::Span`] on completion. All other emitted events are sent to an [`opentelemetry::logs::Logger`] as [`opentelemetry::logs::LogRecord`]s.
+Diagnostic events produced by the [`macro@emit::span`] macro are sent to an [`opentelemetry::trace::Tracer`] as an [`opentelemetry::trace::Span`] on completion.
+All other emitted events are sent to an [`opentelemetry::logs::Logger`] as [`opentelemetry::logs::LogRecord`]s.
 
 # Span lifecycle
 
@@ -76,12 +77,13 @@ The following well-known `emit` properties are interpreted during span completio
 
 - `err`: Mapped onto the semantic `exception` event on the span, and the span's status will be set to `Error`.
 - `lvl`: If its value is `error`, the span's status will be set to `Error`.
+- `span_links`: Populates a set of links on the span.
 
 If the span doesn't have a meaningful name configured already, then the rendered message will be used.
 
 # Sampling
 
-By default, `emit` events will be excluded if they are inside an unsampled OpenTelemetry trace, even if that trace is marked as recorded. OpenTelemetry will still propagate sampling decisions, but `emit`'s own spans will not be constructed within the unsampled trace.
+By default, `emit` will exclude any of its own spans that are created within unsampled traces.
 
 You can change this behavior by overriding the filter using [`emit::Setup::emit_when`] on the value returned by [`setup`].
 
@@ -89,6 +91,7 @@ You can change this behavior by overriding the filter using [`emit::Setup::emit_
 
 `emit` doesn't track trace flags, trace state, or whether links are remote in its model.
 This information will be populated from the current span context.
+You can add span links through the OpenTelemetry SDK itself, even to spans created by `emit`, if you need to configure these.
 
 # Span parents
 
@@ -2262,6 +2265,46 @@ mod tests {
             ],
         )]
         fn emit_span() {}
+
+        emit_span();
+
+        let spans = spans.get_finished_spans().unwrap();
+
+        assert_eq!(1, spans.len());
+
+        assert_eq!(1, spans[0].links.links.len());
+
+        assert_eq!(
+            "4bf92f3577b34da6a3ce929d0e0e4736",
+            spans[0].links.links[0].span_context.trace_id().to_string()
+        );
+        assert_eq!(
+            "00f067aa0ba902b7",
+            spans[0].links.links[0].span_context.span_id().to_string()
+        );
+    }
+
+    #[test]
+    fn emit_span_span_links_from_otel() {
+        static SLOT: AmbientSlot = AmbientSlot::new();
+        let (_, spans, _, _) = build(&SLOT);
+
+        #[emit::span(
+            rt: SLOT.get(),
+            "emit span",
+        )]
+        fn emit_span() {
+            Context::current().span().add_link(
+                SpanContext::new(
+                    TraceId::from_hex("4bf92f3577b34da6a3ce929d0e0e4736").unwrap(),
+                    SpanId::from_hex("00f067aa0ba902b7").unwrap(),
+                    TraceFlags::SAMPLED,
+                    true,
+                    TraceState::default(),
+                ),
+                Default::default(),
+            );
+        }
 
         emit_span();
 

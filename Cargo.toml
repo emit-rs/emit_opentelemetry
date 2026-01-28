@@ -13,6 +13,7 @@ edition = "2021"
 [workspace]
 members = [
     "examples/getting_started",
+    "examples/multi_framework",
 ]
 
 [dependencies.emit]
