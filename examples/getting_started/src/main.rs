@@ -4,7 +4,7 @@ This example demonstrates configuring `emit` to forward its events through the O
 This is useful if you're already using the OpenTelemtry SDK, or if your application uses multiple frameworks.
 */
 
-use opentelemetry_otlp::WithTonicConfig;
+use opentelemetry_otlp::WithTonicConfig as _;
 
 #[tokio::main]
 async fn main() {
