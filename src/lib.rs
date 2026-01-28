@@ -1,7 +1,10 @@
 /*!
 Integrate `emit` with the OpenTelemetry SDK.
 
-This library forwards diagnostic events from `emit` through the OpenTelemetry SDK as log records and spans. This library is for applications that already use the OpenTelemetry SDK. It's also intended for applications that need to unify multiple instrumentation libraries, like `emit`, `log`, and `tracing`, into a shared pipeline. If you'd just like to send `emit` diagnostics via OTLP to the OpenTelemetry Collector or other compatible service, then consider [`emit_otlp`](https://docs.rs/emit_otlp).
+This library forwards diagnostic events from `emit` through the OpenTelemetry SDK as log records and spans.
+This library is for applications that already use the OpenTelemetry SDK.
+It's also intended for applications that need to unify multiple instrumentation libraries, like `emit`, `log`, and `tracing`, into a shared pipeline.
+If you'd just like to send `emit` diagnostics via OTLP to the OpenTelemetry Collector or other compatible service, then consider [`emit_otlp`](https://docs.rs/emit_otlp).
 
 `emit_opentelemetry` version `x.y.z` is compatible with `opentelemetry_sdk` version `x.y.*`.
 
@@ -13,16 +16,16 @@ Configure the OpenTelemetry SDK as per its documentation, then add `emit` and `e
 [dependencies.emit]
 version = "1"
 
-# add `emit_openetelemetry` with the same major/minor as the OpenTelemetry SDK
+# add `emit_opentelemetry` with the same major/minor as the OpenTelemetry SDK
 [dependencies.emit_opentelemetry]
-version = "0.30"
+version = "0.31"
 
 [dependencies.opentelemetry_sdk]
-version = "0.30"
+version = "0.31"
 features = ["trace", "logs"]
 
 [dependencies.opentelemetry]
-version = "0.30"
+version = "0.31"
 features = ["trace", "logs"]
 ```
 
@@ -53,37 +56,44 @@ fn main() {
 
 Diagnostic events produced by the [`macro@emit::span`] macro are sent to an [`opentelemetry::trace::Tracer`] as an [`opentelemetry::trace::Span`] on completion. All other emitted events are sent to an [`opentelemetry::logs::Logger`] as [`opentelemetry::logs::LogRecord`]s.
 
-# Mapping
+# Span lifecycle
 
-`emit` events are mapped into the OpenTelemetry data model as follows:
+Spans created by `emit`'s `#[emit::span]` attribute will be created through the configured [`opentelemetry::trace::TracerProvider`].
+The following well-known `emit` properties are interpreted during span creation:
 
-- When [`emit::Ctxt::open_push`] is called, which is done at the start of functions annotated with `#[emit::span]`, a span is created in the configured [`opentelemetry::trace::TracerProvider`].
-  - If the properties include a `span_name` then it will be used as the name of the created span, otherwise `emit_span` will be used until the span is emitted.
-  - If the properties include a `span_kind` then it will be used as the kind of the created span.
-- When [`emit::Ctxt::open_root`] is called, which is done manually through [`emit::frame::Frame::root`], a span is created as in the `open_push` case above if present, otherwise the current context is cleared.
-- When [`emit::Ctxt::open_disabled`] is called, which is done in the same scenarios as `open_push` when `emit`'s configured filter returns `false`, a span with the sampling flag unset is created.
-- When [`emit::Emitter::emit`] is called, which is done at the end of functions annotated with `#[emit::span]`, then the `emit` event will be mapped to either an OpenTelemetry log record or span.
-  - If the event has a span id and it matches the currently active span in the OpenTelemetry context then it will be completed as a span.
-    - If the span doesn't have a meaningful name configured already, then the rendered message will be used.
-    - If the `emit` event contains the well-known `err` property, it will be mapped onto the semantic `exception` event on the span, and the span's status will be set to `Error`.
-    - If the `emit` event contains the well-known `lvl` property, and its value is `error`, the span's status will be set to `Error`.
-  - If the event isn't for a span, then it will be emitted as a log record. `emit` events aren't ever added as events on OpenTelemetry spans.
-  - Properties on the `emit` event are mapped onto attributes on the resulting OpenTelemetry item.
+- `span_id`: Sets the id of the span. If the id matches the current span then no new span will be created.
+- `trace_id`: Sets the trace id of the span. Otherwise the current trace id will be used.
+- `span_name`: Sets the name of the span. Otherwise a default name derived from the span's message template will be used.
+- `span_kind`: Sets the kind of the span. Otherwise the default kind of _internal_ will be used.
+- `span_links`: Populates a set of links on the span.
 
-# Span parents
+Spans created through `emit` don't carry additional attributes on them until completion.
 
-When using `emit_opentelemetry`, any `SpanCtxt` pulled from ambient context won't carry a parent span id, even for non-root spans.
-This is because the OpenTelemetry SDK doesn't have an API for accessing the parent-child relationship of a span after its construction.
+Spans are completed either by emitting an event manually, or when the function annotated with `#[emit::span]` completes.
+At this point if the event is a span, and its context matches the current OpenTelemetry span context, it'll be emitted as a span.
+Otherwise it'll be emitted as a regular log event.
+The following well-known `emit` properties are interpreted during span completion:
 
-# Other span properties
+- `err`: Mapped onto the semantic `exception` event on the span, and the span's status will be set to `Error`.
+- `lvl`: If its value is `error`, the span's status will be set to `Error`.
 
-`emit_opentelemetry` doesn't manage its ambient context through the OpenTelemetry SDK. Only properties that are needed at span construction are mapped. That means other frameworks interacting with spans created by `emit` will see mostly empty spans. This behavior may be changed in the future.
+If the span doesn't have a meaningful name configured already, then the rendered message will be used.
 
 # Sampling
 
 By default, `emit` events will be excluded if they are inside an unsampled OpenTelemetry trace, even if that trace is marked as recorded. OpenTelemetry will still propagate sampling decisions, but `emit`'s own spans will not be constructed within the unsampled trace.
 
 You can change this behavior by overriding the filter using [`emit::Setup::emit_when`] on the value returned by [`setup`].
+
+# Span links
+
+`emit` doesn't track trace flags, trace state, or whether links are remote in its model.
+This information will be populated from the current span context.
+
+# Span parents
+
+When using `emit_opentelemetry`, any `SpanCtxt` pulled from ambient context won't carry a parent span id, even for non-root spans.
+This is because the OpenTelemetry SDK doesn't have an API for accessing the parent-child relationship of a span after its construction.
 
 # Limitations
 
