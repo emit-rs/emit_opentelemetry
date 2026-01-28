@@ -7,6 +7,8 @@
 Integrate [`emit`](https://github.com/emit-rs/emit) with the OpenTelemetry SDK.
 
 This library forwards diagnostic events from emit through the OpenTelemetry SDK as log records and spans.
+It lets you use `emit`'s ergonomic developer-oriented APIs in your OpenTelemetry-instrumented applications.
+See [the guide](https://emit-rs.io) for more details on using `emit`.
 
 ## Getting started
 

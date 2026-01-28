@@ -1,7 +1,10 @@
 /*!
 Integrate `emit` with the OpenTelemetry SDK.
 
-This library forwards diagnostic events from `emit` through the OpenTelemetry SDK as log records and spans. This library is for applications that already use the OpenTelemetry SDK. It's also intended for applications that need to unify multiple instrumentation libraries, like `emit`, `log`, and `tracing`, into a shared pipeline. If you'd just like to send `emit` diagnostics via OTLP to the OpenTelemetry Collector or other compatible service, then consider [`emit_otlp`](https://docs.rs/emit_otlp).
+This library forwards diagnostic events from `emit` through the OpenTelemetry SDK as log records and spans.
+This library is for applications that already use the OpenTelemetry SDK.
+It's also intended for applications that need to unify multiple instrumentation libraries, like `emit`, `log`, and `tracing`, into a shared pipeline.
+If you'd just like to send `emit` diagnostics via OTLP to the OpenTelemetry Collector or other compatible service, then consider [`emit_otlp`](https://docs.rs/emit_otlp).
 
 `emit_opentelemetry` version `x.y.z` is compatible with `opentelemetry_sdk` version `x.y.*`.
 
@@ -13,16 +16,16 @@ Configure the OpenTelemetry SDK as per its documentation, then add `emit` and `e
 [dependencies.emit]
 version = "1"
 
-# add `emit_openetelemetry` with the same major/minor as the OpenTelemetry SDK
+# add `emit_opentelemetry` with the same major/minor as the OpenTelemetry SDK
 [dependencies.emit_opentelemetry]
-version = "0.30"
+version = "0.31"
 
 [dependencies.opentelemetry_sdk]
-version = "0.30"
+version = "0.31"
 features = ["trace", "logs"]
 
 [dependencies.opentelemetry]
-version = "0.30"
+version = "0.31"
 features = ["trace", "logs"]
 ```
 
@@ -53,26 +56,44 @@ fn main() {
 
 Diagnostic events produced by the [`macro@emit::span`] macro are sent to an [`opentelemetry::trace::Tracer`] as an [`opentelemetry::trace::Span`] on completion. All other emitted events are sent to an [`opentelemetry::logs::Logger`] as [`opentelemetry::logs::LogRecord`]s.
 
-# Mapping
+# Span lifecycle
 
-`emit` events are mapped into the OpenTelemetry data model as follows:
+Spans created by `emit`'s `#[emit::span]` attribute will be created through the configured [`opentelemetry::trace::TracerProvider`].
+The following well-known `emit` properties are interpreted during span creation:
 
-- When [`emit::Ctxt::open_push`] is called, which is done at the start of functions annotated with `#[emit::span]`, a span is created in the configured [`opentelemetry::trace::TracerProvider`].
-  - If the properties include a `span_name` then it will be used as the name of the created span, otherwise `emit_span` will be used unil the span is emitted.
-  - If the properties include a `span_kind` then it will be used as the kind of the created span.
-- When [`emit::Emitter::emit`] is called, which is done at the end of functions annotated with `#[emit::span]`, then the `emit` event will be mapped to either an OpenTelemetry log record or span.
-  - If the event has a span id and it matches the currently active span in the OpenTelemetry context then it will be completed as a span.
-    - If the span doesn't have a meaningful name configured already, then the rendered message will be used.
-    - If the `emit` event contains the well-known `err` property, it will be mapped onto the semantic `exception` event on the span, and the span's status will be set to `Error`.
-    - If the `emit` event contains the well-known `lvl` property, and its value is `error`, the span's status will be set to `Error`.
-  - If the event isn't for a span, then it will be emitted as a log record. `emit` events aren't ever added as events on OpenTelemetry spans.
-  - Properties on the `emit` event are mapped onto attributes on the resulting OpenTelemetry item.
+- `span_id`: Sets the id of the span. If the id matches the current span then no new span will be created.
+- `trace_id`: Sets the trace id of the span. Otherwise the current trace id will be used.
+- `span_name`: Sets the name of the span. Otherwise a default name derived from the span's message template will be used.
+- `span_kind`: Sets the kind of the span. Otherwise the default kind of _internal_ will be used.
+- `span_links`: Populates a set of links on the span.
+
+Spans created through `emit` don't carry additional attributes on them until completion.
+
+Spans are completed either by emitting an event manually, or when the function annotated with `#[emit::span]` completes.
+At this point if the event is a span, and its context matches the current OpenTelemetry span context, it'll be emitted as a span.
+Otherwise it'll be emitted as a regular log event.
+The following well-known `emit` properties are interpreted during span completion:
+
+- `err`: Mapped onto the semantic `exception` event on the span, and the span's status will be set to `Error`.
+- `lvl`: If its value is `error`, the span's status will be set to `Error`.
+
+If the span doesn't have a meaningful name configured already, then the rendered message will be used.
 
 # Sampling
 
 By default, `emit` events will be excluded if they are inside an unsampled OpenTelemetry trace, even if that trace is marked as recorded. OpenTelemetry will still propagate sampling decisions, but `emit`'s own spans will not be constructed within the unsampled trace.
 
 You can change this behavior by overriding the filter using [`emit::Setup::emit_when`] on the value returned by [`setup`].
+
+# Span links
+
+`emit` doesn't track trace flags, trace state, or whether links are remote in its model.
+This information will be populated from the current span context.
+
+# Span parents
+
+When using `emit_opentelemetry`, any `SpanCtxt` pulled from ambient context won't carry a parent span id, even for non-root spans.
+This is because the OpenTelemetry SDK doesn't have an API for accessing the parent-child relationship of a span after its construction.
 
 # Limitations
 
@@ -135,8 +156,7 @@ Also see the [`opentelemetry`] docs for any details on getting diagnostics out o
 #![doc(html_logo_url = "https://raw.githubusercontent.com/emit-rs/emit/main/asset/logo.svg")]
 #![deny(missing_docs)]
 
-use std::{borrow::Cow, cell::RefCell, fmt, ops::ControlFlow, sync::Arc};
-
+use emit::well_known::KEY_SPAN_LINKS;
 use emit::{
     well_known::{
         KEY_ERR, KEY_EVT_KIND, KEY_LVL, KEY_SPAN_ID, KEY_SPAN_KIND, KEY_SPAN_NAME, KEY_SPAN_PARENT,
@@ -144,14 +164,16 @@ use emit::{
     },
     Filter, Props,
 };
-
+use opentelemetry::trace::{Link, SamplingDecision, SamplingResult, TraceState};
 use opentelemetry::{
     logs::{AnyValue, LogRecord, Logger, LoggerProvider, Severity},
     trace::{
         SpanContext, SpanId, SpanKind, Status, TraceContextExt, TraceId, Tracer, TracerProvider,
     },
-    Context, ContextGuard, Key, KeyValue, Value,
+    Context, ContextGuard, Key, KeyValue, TraceFlags, Value,
 };
+use std::fmt::{Display, Formatter};
+use std::{borrow::Cow, cell::RefCell, fmt, ops::ControlFlow, sync::Arc};
 
 mod internal_metrics;
 
@@ -241,7 +263,7 @@ An [`emit::Ctxt`] created during [`setup`] for integrating `emit` with the OpenT
 
 This type is responsible for intercepting calls that push span state to `emit`'s ambient context and forwarding them to the OpenTelemetry SDK's own context.
 
-When [`macro@emit::span`] is called, an [`opentelemetry::trace::Span`] is started using the given trace and span ids. The span doesn't carry any other ambient properties until it's completed either through [`emit::span::ActiveSpan::complete`], or at the end of the scope the [`macro@emit::span`] macro covers.
+When [`macro@emit::span`] is called, an [`opentelemetry::trace::Span`] is started using the given trace and span ids. The span doesn't carry any other ambient properties until it's completed either through [`emit::span::SpanGuard::complete`], or at the end of the scope the [`macro@emit::span`] macro covers.
 */
 pub struct OpenTelemetryCtxt<C, T> {
     tracer: T,
@@ -261,12 +283,20 @@ pub struct OpenTelemetryFrame<F> {
     // If this field is false and `active` is `None` then the frame doesn't
     // hold an OpenTelemetry span
     active: bool,
-    // Whether to try end the span upon closing the frame
-    // Normally, this should be false by the time `close`` is called because
-    // the emitter will have ended the span
-    end_on_close: bool,
+    options: OpenTelemetryFrameOptions,
     // The frame from the wrapped `Ctxt`
     inner: F,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct OpenTelemetryFrameOptions {
+    // Whether to try end the span upon closing the frame
+    // Normally, this should be false by the time `close` is called because
+    // the emitter will have ended the span
+    end_on_close: bool,
+    // Whether to build a default span name on close
+    // This value will be `true` if the span was originally started with a default name
+    update_default_name_on_close: bool,
 }
 
 /**
@@ -327,7 +357,7 @@ thread_local! {
 
 struct ActiveFrame {
     _guard: ContextGuard,
-    end_on_close: bool,
+    options: OpenTelemetryFrameOptions,
 }
 
 fn push(guard: ActiveFrame) {
@@ -355,65 +385,64 @@ where
     type Frame = OpenTelemetryFrame<C::Frame>;
 
     fn open_root<P: emit::Props>(&self, props: P) -> Self::Frame {
-        let trace_id = props.pull::<emit::TraceId, _>(KEY_TRACE_ID);
-        let span_id = props.pull::<emit::SpanId, _>(KEY_SPAN_ID);
+        let (incoming, props) = incoming_span_ctxt(&self.tracer, props, false);
 
-        // Only open a span if the props include a span id
-        if let Some(span_id) = span_id {
-            let ctxt = Context::current();
-
-            let span_id = otel_span_id(span_id);
-
-            // Only open a span if the id has changed
-            if span_id != ctxt.span().span_context().span_id() {
-                let span_kind = props
-                    .pull::<emit::span::SpanKind, _>(KEY_SPAN_KIND)
-                    .map(|kind| match kind {
-                        emit::span::SpanKind::Client => SpanKind::Client,
-                        emit::span::SpanKind::Server => SpanKind::Server,
-                        emit::span::SpanKind::Producer => SpanKind::Producer,
-                        emit::span::SpanKind::Consumer => SpanKind::Consumer,
-                        _ => SpanKind::Internal,
-                    })
-                    .unwrap_or(SpanKind::Internal);
-
-                let span_name = props
-                    .pull::<String, _>(KEY_SPAN_NAME)
-                    .map(Cow::Owned)
-                    .unwrap_or(Cow::Borrowed("emit_span"));
-
-                let trace_id = trace_id.map(otel_trace_id);
-
-                let mut span = self
-                    .tracer
-                    .span_builder(span_name)
-                    .with_kind(span_kind)
-                    .with_span_id(span_id);
-
-                if let Some(trace_id) = trace_id {
-                    span = span.with_trace_id(trace_id);
-                }
-
-                let ctxt = ctxt.with_span(span.start(&self.tracer));
-
-                return OpenTelemetryFrame {
-                    active: false,
-                    end_on_close: true,
-                    slot: Some(ctxt),
-                    inner: self.inner.open_root(props),
-                };
-            }
-        }
+        let (slot, options) = match incoming {
+            // An empty root context should unset any active OTel context
+            IncomingSpanCtxt::None => (Some(Context::new()), Default::default()),
+            // If the context is the same then don't track anything in this frame
+            IncomingSpanCtxt::Same => (None, Default::default()),
+            // If the context is different then track it in this frame
+            IncomingSpanCtxt::Different(context, options) => (Some(context), options),
+        };
 
         OpenTelemetryFrame {
             active: false,
-            end_on_close: false,
-            slot: None,
+            options,
+            slot,
             inner: self.inner.open_root(props),
         }
     }
 
-    // TODO: open_push
+    fn open_disabled<P: Props>(&self, props: P) -> Self::Frame {
+        let (incoming, props) = incoming_span_ctxt(&self.tracer, props, true);
+
+        let (slot, options) = match incoming {
+            // An empty context and the same context are equivalent; neither track anything in this frame
+            IncomingSpanCtxt::None => (None, Default::default()),
+            IncomingSpanCtxt::Same => (None, Default::default()),
+            // If the context is different then track it in this frame
+            IncomingSpanCtxt::Different(context, options) => (Some(context), options),
+        };
+
+        OpenTelemetryFrame {
+            active: false,
+            options,
+            slot,
+            inner: self.inner.open_disabled(props),
+        }
+    }
+
+    fn open_push<P: Props>(&self, props: P) -> Self::Frame {
+        let (incoming, props) = incoming_span_ctxt(&self.tracer, props, false);
+
+        let (slot, options) = match incoming {
+            // An empty context and the same context are equivalent; neither track anything in this frame
+            // Note that if the sampling decision changed without the span context changing we'll ignore it
+            IncomingSpanCtxt::None => (None, Default::default()),
+            IncomingSpanCtxt::Same => (None, Default::default()),
+            // If the context is different then track it in this frame
+            // The context will be unsampled, so any downstream spans will also be unsampled
+            IncomingSpanCtxt::Different(context, options) => (Some(context), options),
+        };
+
+        OpenTelemetryFrame {
+            active: false,
+            options,
+            slot,
+            inner: self.inner.open_push(props),
+        }
+    }
 
     fn enter(&self, local: &mut Self::Frame) {
         self.inner.enter(&mut local.inner);
@@ -423,7 +452,7 @@ where
 
             push(ActiveFrame {
                 _guard: guard,
-                end_on_close: local.end_on_close,
+                options: local.options,
             });
             local.active = true;
         }
@@ -445,7 +474,8 @@ where
             let props = OpenTelemetryProps {
                 ctxt: emit::span::SpanCtxt::new(
                     emit::TraceId::from_bytes(trace_id),
-                    None, // Span parents are tracked by OpenTelemetry internally
+                    // Span parents are tracked by OTel internally, we can't access them
+                    None,
                     emit::SpanId::from_bytes(span_id),
                 ),
                 inner: props as *const C::Current,
@@ -462,7 +492,7 @@ where
             frame.slot = Some(Context::current());
 
             if let Some(active) = pop() {
-                frame.end_on_close = active.end_on_close;
+                frame.options = active.options;
             }
             frame.active = false;
         }
@@ -470,7 +500,7 @@ where
 
     fn close(&self, mut frame: Self::Frame) {
         // If the span hasn't been closed through an event, then close it now
-        if frame.end_on_close {
+        if frame.options.end_on_close {
             // This will only be `None` if `close` is called out-of-order
             // with `exit`
             if let Some(ctxt) = frame.slot.take() {
@@ -480,6 +510,136 @@ where
                 span.end();
             }
         }
+    }
+}
+
+fn incoming_span_ctxt<T: Tracer>(
+    tracer: &T,
+    props: impl emit::Props,
+    suppress: bool,
+) -> (IncomingSpanCtxt, impl Props)
+where
+    T::Span: Send + Sync + 'static,
+{
+    let span_id = props.pull::<emit::SpanId, _>(KEY_SPAN_ID);
+
+    let Some(span_id) = span_id else {
+        return (
+            IncomingSpanCtxt::None,
+            ExcludeSpanCtxtProps { inner: props },
+        );
+    };
+
+    let ctxt = Context::current();
+
+    let span_id = otel_span_id(span_id);
+
+    // Only open a span if the id has changed
+    if span_id == ctxt.span().span_context().span_id() {
+        return (
+            IncomingSpanCtxt::Same,
+            ExcludeSpanCtxtProps { inner: props },
+        );
+    }
+
+    // Map `emit`'s well-known span properties into the OTel context
+    // Note that only properties that are needed on span construction are
+    // handled here. Other span properties will be mapped when the span is emitted
+
+    let span_links = props
+        .get(KEY_SPAN_LINKS)
+        .map(|links| {
+            otel_span_links(
+                links,
+                ctxt.span().span_context().trace_flags(),
+                ctxt.span().span_context().is_remote(),
+                ctxt.span().span_context().trace_state(),
+            )
+        })
+        .unwrap_or_default();
+
+    let span_kind = props
+        .pull::<emit::span::SpanKind, _>(KEY_SPAN_KIND)
+        .map(|kind| match kind {
+            emit::span::SpanKind::Client => SpanKind::Client,
+            emit::span::SpanKind::Server => SpanKind::Server,
+            emit::span::SpanKind::Producer => SpanKind::Producer,
+            emit::span::SpanKind::Consumer => SpanKind::Consumer,
+            _ => SpanKind::Internal,
+        })
+        .unwrap_or(SpanKind::Internal);
+
+    let span_name = props.pull::<String, _>(KEY_SPAN_NAME).map(Cow::Owned);
+
+    // If the props include a span name then don't change it when completing the span
+    // We need to track this in our own frame type because the OTel SDK doesn't expose
+    // the name after construction
+    let update_default_name_on_close = span_name.is_none();
+
+    let trace_id = props.pull::<emit::TraceId, _>(KEY_TRACE_ID);
+
+    let trace_id = trace_id.map(otel_trace_id);
+
+    let mut span = tracer
+        .span_builder(span_name.unwrap_or(Cow::Borrowed("emit_span")))
+        .with_kind(span_kind)
+        .with_span_id(span_id);
+
+    if let Some(trace_id) = trace_id {
+        span = span.with_trace_id(trace_id);
+    }
+
+    span = span.with_links(span_links);
+
+    // If the context was discarded by `emit`'s filter then open it as disabled
+    if suppress {
+        span = span.with_sampling_result(SamplingResult {
+            decision: SamplingDecision::Drop,
+            attributes: vec![],
+            trace_state: Default::default(),
+        });
+    }
+
+    let ctxt = ctxt.with_span(span.start(tracer));
+
+    (
+        IncomingSpanCtxt::Different(
+            ctxt,
+            OpenTelemetryFrameOptions {
+                update_default_name_on_close,
+                end_on_close: true,
+            },
+        ),
+        ExcludeSpanCtxtProps { inner: props },
+    )
+}
+
+enum IncomingSpanCtxt {
+    None,
+    Same,
+    Different(Context, OpenTelemetryFrameOptions),
+}
+
+/**
+A filter used when pushing properties into `emit`'s context that removes properties
+tracked by the OpenTelemetry SDK.
+*/
+struct ExcludeSpanCtxtProps<P> {
+    inner: P,
+}
+
+impl<P: emit::Props> emit::Props for ExcludeSpanCtxtProps<P> {
+    fn for_each<'kv, F: FnMut(emit::Str<'kv>, emit::Value<'kv>) -> ControlFlow<()>>(
+        &'kv self,
+        mut for_each: F,
+    ) -> ControlFlow<()> {
+        self.inner.for_each(|key, value| match key.get() {
+            // Properties that come from the OTel context
+            KEY_TRACE_ID | KEY_SPAN_ID | KEY_SPAN_PARENT | KEY_SPAN_NAME | KEY_SPAN_KIND
+            | KEY_SPAN_LINKS => ControlFlow::Continue(()),
+            // Properties to pass through to the underlying context
+            _ => for_each(key, value),
+        })
     }
 }
 
@@ -597,7 +757,7 @@ impl<L: Logger> emit::Emitter for OpenTelemetryEmitter<L> {
         if emit::kind::is_span_filter().matches(&evt) {
             let mut emitted = false;
             with_current(|frame| {
-                if frame.end_on_close {
+                if frame.options.end_on_close {
                     let ctxt = Context::current();
                     let span = ctxt.span();
 
@@ -610,9 +770,9 @@ impl<L: Logger> emit::Emitter for OpenTelemetryEmitter<L> {
 
                     // If the event is for the current span then complete it
                     if Some(span_id) == evt_span_id {
-                        let mut new_span_name = None;
                         let mut status = Status::Ok;
                         let mut status_is_descriptive_err = false;
+                        let mut span_links = Vec::new();
 
                         let _ = evt.props().for_each(|k, v| {
                             if k == KEY_LVL {
@@ -638,16 +798,24 @@ impl<L: Logger> emit::Emitter for OpenTelemetryEmitter<L> {
                                 return ControlFlow::Continue(());
                             }
 
-                            if k == KEY_SPAN_NAME {
-                                new_span_name = Some(v.to_string());
+                            if k == KEY_SPAN_LINKS {
+                                span_links = otel_span_links(
+                                    v,
+                                    span.span_context().trace_flags(),
+                                    span.span_context().is_remote(),
+                                    span.span_context().trace_state(),
+                                );
+
+                                return ControlFlow::Continue(());
                             }
 
-                            // Ignored
+                            // Ignored; these are all handled during span construction
                             if k == KEY_TRACE_ID
                                 || k == KEY_SPAN_ID
                                 || k == KEY_SPAN_PARENT
                                 || k == KEY_EVT_KIND
                                 || k == KEY_SPAN_KIND
+                                || k == KEY_SPAN_NAME
                             {
                                 return ControlFlow::Continue(());
                             }
@@ -659,16 +827,21 @@ impl<L: Logger> emit::Emitter for OpenTelemetryEmitter<L> {
                             ControlFlow::Continue(())
                         });
 
-                        let name = new_span_name.unwrap_or_else(|| {
-                            MessageRenderer {
-                                fmt: &self.span_name,
-                                evt: &evt,
-                            }
-                            .to_string()
-                        });
+                        if frame.options.update_default_name_on_close {
+                            span.update_name(
+                                MessageRenderer {
+                                    fmt: &self.span_name,
+                                    evt: &evt,
+                                }
+                                .to_string(),
+                            );
+                        }
 
-                        span.update_name(name);
                         span.set_status(status);
+
+                        for link in span_links {
+                            span.add_link(link.span_context, Default::default());
+                        }
 
                         if let Some(extent) = evt.extent().and_then(|ex| ex.as_range()) {
                             span.end_with_timestamp(extent.end.to_system_time());
@@ -676,7 +849,7 @@ impl<L: Logger> emit::Emitter for OpenTelemetryEmitter<L> {
                             span.end();
                         }
 
-                        frame.end_on_close = false;
+                        frame.options.end_on_close = false;
                         emitted = true;
                     }
                 }
@@ -755,6 +928,11 @@ impl<L: Logger> emit::Emitter for OpenTelemetryEmitter<L> {
                     }
                 }
 
+                // Ignored
+                if k == KEY_SPAN_NAME || k == KEY_SPAN_KIND || k == KEY_SPAN_LINKS {
+                    return ControlFlow::Continue(());
+                }
+
                 if let Some(v) = otel_log_value(v) {
                     attributes.push((Key::new(k.to_cow()), v));
                 }
@@ -769,10 +947,15 @@ impl<L: Logger> emit::Emitter for OpenTelemetryEmitter<L> {
             record.set_timestamp(extent.as_point().to_system_time());
         }
 
-        // NOTE: We don't currently have a way to set these on a generic `impl LogRecord`
-        // The record will use whatever is on the OpenTelemetry context stack.
-        // We should possibly enter a span just for the sake of logging here
-        let _ = (trace_id, span_id);
+        let context = Context::current();
+        let span = context.span();
+        let span = span.span_context();
+
+        let trace_id = trace_id.unwrap_or_else(|| span.trace_id());
+        let span_id = span_id.unwrap_or_else(|| span.span_id());
+        let trace_flags = Some(span.trace_flags());
+
+        record.set_trace_context(trace_id, span_id, trace_flags);
 
         self.logger.emit(record);
     }
@@ -783,17 +966,25 @@ impl<L: Logger> emit::Emitter for OpenTelemetryEmitter<L> {
 }
 
 /**
-A filter that excludes events inside an unsampled trace.
+A filter that excludes span events inside an unsampled trace.
 */
 pub struct OpenTelemetryIsSampledFilter {}
 
 impl emit::Filter for OpenTelemetryIsSampledFilter {
-    fn matches<E: emit::event::ToEvent>(&self, _: E) -> bool {
-        let ctxt = Context::current();
-        let span = ctxt.span();
-        let span_ctxt = span.span_context();
+    fn matches<E: emit::event::ToEvent>(&self, evt: E) -> bool {
+        let evt = evt.to_event();
 
-        span_ctxt == &SpanContext::NONE || span_ctxt.is_sampled()
+        // If the event is a span then only include it if it matches the current OTel span context
+        if emit::kind::is_span_filter().matches(&evt) {
+            let ctxt = Context::current();
+            let span = ctxt.span();
+            let span_ctxt = span.span_context();
+
+            span_ctxt == &SpanContext::NONE || span_ctxt.is_sampled()
+        } else {
+            // If the event is not a span then include it
+            true
+        }
     }
 }
 
@@ -827,6 +1018,498 @@ fn otel_log_value(v: emit::Value) -> Option<AnyValue> {
     }
 }
 
+fn otel_span_links(
+    v: emit::Value,
+    trace_flags: TraceFlags,
+    is_remote: bool,
+    trace_state: &TraceState,
+) -> Vec<Link> {
+    // A `serde::Serializer` that extracts span links in `emit`'s `["{traceid}-{spanid}"]`
+    // format and converts them into OpenTelemetry links
+
+    use serde::ser::{
+        Error, Impossible, Serialize, SerializeSeq, SerializeTuple, SerializeTupleStruct,
+        SerializeTupleVariant, Serializer, StdError,
+    };
+
+    struct Extract<'a> {
+        links: Vec<Link>,
+        trace_flags: TraceFlags,
+        is_remote: bool,
+        trace_state: &'a TraceState,
+    }
+
+    #[derive(Debug)]
+    struct ExtractError;
+
+    impl fmt::Display for ExtractError {
+        fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+            f.write_str("unsupported value for span links")
+        }
+    }
+
+    impl StdError for ExtractError {}
+
+    impl Error for ExtractError {
+        fn custom<T>(_: T) -> Self
+        where
+            T: Display,
+        {
+            ExtractError
+        }
+    }
+
+    impl<'a> Serializer for Extract<'a> {
+        type Ok = Vec<Link>;
+        type Error = ExtractError;
+        type SerializeSeq = Self;
+        type SerializeTuple = Self;
+        type SerializeTupleStruct = Self;
+        type SerializeTupleVariant = Self;
+        type SerializeMap = Impossible<Self::Ok, Self::Error>;
+        type SerializeStruct = Impossible<Self::Ok, Self::Error>;
+        type SerializeStructVariant = Impossible<Self::Ok, Self::Error>;
+
+        fn serialize_bool(self, _: bool) -> Result<Self::Ok, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_i8(self, _: i8) -> Result<Self::Ok, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_i16(self, _: i16) -> Result<Self::Ok, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_i32(self, _: i32) -> Result<Self::Ok, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_i64(self, _: i64) -> Result<Self::Ok, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_u8(self, _: u8) -> Result<Self::Ok, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_u16(self, _: u16) -> Result<Self::Ok, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_u32(self, _: u32) -> Result<Self::Ok, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_u64(self, _: u64) -> Result<Self::Ok, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_f32(self, _: f32) -> Result<Self::Ok, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_f64(self, _: f64) -> Result<Self::Ok, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_char(self, _: char) -> Result<Self::Ok, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_str(self, _: &str) -> Result<Self::Ok, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_bytes(self, _: &[u8]) -> Result<Self::Ok, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_none(self) -> Result<Self::Ok, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_some<T>(self, value: &T) -> Result<Self::Ok, Self::Error>
+        where
+            T: ?Sized + Serialize,
+        {
+            value.serialize(self)
+        }
+
+        fn serialize_unit(self) -> Result<Self::Ok, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_unit_struct(self, _: &'static str) -> Result<Self::Ok, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_unit_variant(
+            self,
+            _: &'static str,
+            _: u32,
+            _: &'static str,
+        ) -> Result<Self::Ok, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_newtype_struct<T>(
+            self,
+            _: &'static str,
+            value: &T,
+        ) -> Result<Self::Ok, Self::Error>
+        where
+            T: ?Sized + Serialize,
+        {
+            value.serialize(self)
+        }
+
+        fn serialize_newtype_variant<T>(
+            self,
+            _: &'static str,
+            _: u32,
+            _: &'static str,
+            value: &T,
+        ) -> Result<Self::Ok, Self::Error>
+        where
+            T: ?Sized + Serialize,
+        {
+            value.serialize(self)
+        }
+
+        fn serialize_seq(self, _: Option<usize>) -> Result<Self::SerializeSeq, Self::Error> {
+            Ok(self)
+        }
+
+        fn serialize_tuple(self, _: usize) -> Result<Self::SerializeTuple, Self::Error> {
+            Ok(self)
+        }
+
+        fn serialize_tuple_struct(
+            self,
+            _: &'static str,
+            _: usize,
+        ) -> Result<Self::SerializeTupleStruct, Self::Error> {
+            Ok(self)
+        }
+
+        fn serialize_tuple_variant(
+            self,
+            _: &'static str,
+            _: u32,
+            _: &'static str,
+            _: usize,
+        ) -> Result<Self::SerializeTupleVariant, Self::Error> {
+            Ok(self)
+        }
+
+        fn serialize_map(self, _: Option<usize>) -> Result<Self::SerializeMap, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_struct(
+            self,
+            _: &'static str,
+            _: usize,
+        ) -> Result<Self::SerializeStruct, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_struct_variant(
+            self,
+            _: &'static str,
+            _: u32,
+            _: &'static str,
+            _: usize,
+        ) -> Result<Self::SerializeStructVariant, Self::Error> {
+            Err(ExtractError)
+        }
+    }
+
+    impl<'a> SerializeSeq for Extract<'a> {
+        type Ok = Vec<Link>;
+        type Error = ExtractError;
+
+        fn serialize_element<T>(&mut self, value: &T) -> Result<(), Self::Error>
+        where
+            T: ?Sized + Serialize,
+        {
+            self.links.push(value.serialize(ParseLink {
+                trace_flags: self.trace_flags,
+                is_remote: self.is_remote,
+                trace_state: self.trace_state,
+            })?);
+
+            Ok(())
+        }
+
+        fn end(self) -> Result<Self::Ok, Self::Error> {
+            Ok(self.links)
+        }
+    }
+
+    impl<'a> SerializeTuple for Extract<'a> {
+        type Ok = Vec<Link>;
+        type Error = ExtractError;
+
+        fn serialize_element<T>(&mut self, value: &T) -> Result<(), Self::Error>
+        where
+            T: ?Sized + Serialize,
+        {
+            self.links.push(value.serialize(ParseLink {
+                trace_flags: self.trace_flags,
+                is_remote: self.is_remote,
+                trace_state: self.trace_state,
+            })?);
+
+            Ok(())
+        }
+
+        fn end(self) -> Result<Self::Ok, Self::Error> {
+            Ok(self.links)
+        }
+    }
+
+    impl<'a> SerializeTupleStruct for Extract<'a> {
+        type Ok = Vec<Link>;
+        type Error = ExtractError;
+
+        fn serialize_field<T>(&mut self, value: &T) -> Result<(), Self::Error>
+        where
+            T: ?Sized + Serialize,
+        {
+            self.links.push(value.serialize(ParseLink {
+                trace_flags: self.trace_flags,
+                is_remote: self.is_remote,
+                trace_state: self.trace_state,
+            })?);
+
+            Ok(())
+        }
+
+        fn end(self) -> Result<Self::Ok, Self::Error> {
+            Ok(self.links)
+        }
+    }
+
+    impl<'a> SerializeTupleVariant for Extract<'a> {
+        type Ok = Vec<Link>;
+        type Error = ExtractError;
+
+        fn serialize_field<T>(&mut self, value: &T) -> Result<(), Self::Error>
+        where
+            T: ?Sized + Serialize,
+        {
+            self.links.push(value.serialize(ParseLink {
+                trace_flags: self.trace_flags,
+                is_remote: self.is_remote,
+                trace_state: &self.trace_state,
+            })?);
+
+            Ok(())
+        }
+
+        fn end(self) -> Result<Self::Ok, Self::Error> {
+            Ok(self.links)
+        }
+    }
+
+    struct ParseLink<'a> {
+        trace_flags: TraceFlags,
+        is_remote: bool,
+        trace_state: &'a TraceState,
+    }
+
+    impl<'a> Serializer for ParseLink<'a> {
+        type Ok = Link;
+        type Error = ExtractError;
+        type SerializeSeq = Impossible<Self::Ok, Self::Error>;
+        type SerializeTuple = Impossible<Self::Ok, Self::Error>;
+        type SerializeTupleStruct = Impossible<Self::Ok, Self::Error>;
+        type SerializeTupleVariant = Impossible<Self::Ok, Self::Error>;
+        type SerializeMap = Impossible<Self::Ok, Self::Error>;
+        type SerializeStruct = Impossible<Self::Ok, Self::Error>;
+        type SerializeStructVariant = Impossible<Self::Ok, Self::Error>;
+
+        fn serialize_bool(self, _: bool) -> Result<Self::Ok, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_i8(self, _: i8) -> Result<Self::Ok, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_i16(self, _: i16) -> Result<Self::Ok, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_i32(self, _: i32) -> Result<Self::Ok, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_i64(self, _: i64) -> Result<Self::Ok, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_u8(self, _: u8) -> Result<Self::Ok, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_u16(self, _: u16) -> Result<Self::Ok, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_u32(self, _: u32) -> Result<Self::Ok, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_u64(self, _: u64) -> Result<Self::Ok, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_f32(self, _: f32) -> Result<Self::Ok, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_f64(self, _: f64) -> Result<Self::Ok, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_char(self, _: char) -> Result<Self::Ok, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_str(self, v: &str) -> Result<Self::Ok, Self::Error> {
+            let link = emit::span::SpanLink::try_from_str(v).map_err(|_| ExtractError)?;
+
+            Ok(Link::new(
+                SpanContext::new(
+                    otel_trace_id(*link.trace_id()),
+                    otel_span_id(*link.span_id()),
+                    self.trace_flags,
+                    self.is_remote,
+                    self.trace_state.clone(),
+                ),
+                Vec::new(),
+                0,
+            ))
+        }
+
+        fn serialize_bytes(self, _: &[u8]) -> Result<Self::Ok, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_none(self) -> Result<Self::Ok, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_some<T>(self, value: &T) -> Result<Self::Ok, Self::Error>
+        where
+            T: ?Sized + Serialize,
+        {
+            value.serialize(self)
+        }
+
+        fn serialize_unit(self) -> Result<Self::Ok, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_unit_struct(self, _: &'static str) -> Result<Self::Ok, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_unit_variant(
+            self,
+            _: &'static str,
+            _: u32,
+            _: &'static str,
+        ) -> Result<Self::Ok, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_newtype_struct<T>(
+            self,
+            _: &'static str,
+            value: &T,
+        ) -> Result<Self::Ok, Self::Error>
+        where
+            T: ?Sized + Serialize,
+        {
+            value.serialize(self)
+        }
+
+        fn serialize_newtype_variant<T>(
+            self,
+            _: &'static str,
+            _: u32,
+            _: &'static str,
+            value: &T,
+        ) -> Result<Self::Ok, Self::Error>
+        where
+            T: ?Sized + Serialize,
+        {
+            value.serialize(self)
+        }
+
+        fn serialize_seq(self, _: Option<usize>) -> Result<Self::SerializeSeq, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_tuple(self, _: usize) -> Result<Self::SerializeTuple, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_tuple_struct(
+            self,
+            _: &'static str,
+            _: usize,
+        ) -> Result<Self::SerializeTupleStruct, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_tuple_variant(
+            self,
+            _: &'static str,
+            _: u32,
+            _: &'static str,
+            _: usize,
+        ) -> Result<Self::SerializeTupleVariant, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_map(self, _: Option<usize>) -> Result<Self::SerializeMap, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_struct(
+            self,
+            _: &'static str,
+            _: usize,
+        ) -> Result<Self::SerializeStruct, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_struct_variant(
+            self,
+            _: &'static str,
+            _: u32,
+            _: &'static str,
+            _: usize,
+        ) -> Result<Self::SerializeStructVariant, Self::Error> {
+            Err(ExtractError)
+        }
+    }
+
+    v.serialize(Extract {
+        links: Vec::new(),
+        trace_flags,
+        is_remote,
+        trace_state,
+    })
+    .unwrap_or_default()
+}
+
 mod any_value {
     use std::{collections::HashMap, fmt};
 
@@ -844,7 +1527,7 @@ mod any_value {
     /// - Unit types and nones are discarded (effectively treated as undefined).
     /// - Struct and tuple variants are converted into an internally tagged map.
     /// - Unit variants are converted into strings.
-    pub(crate) fn serialize(value: impl serde::Serialize) -> Result<Option<AnyValue>, ()> {
+    pub(crate) fn serialize(value: impl Serialize) -> Result<Option<AnyValue>, ()> {
         value.serialize(ValueSerializer).map_err(|_| ())
     }
 
@@ -1352,6 +2035,27 @@ mod tests {
     }
 
     #[test]
+    fn emit_log_trace_context() {
+        let slot = AmbientSlot::new();
+        let (logs, _, _, _) = build(&slot);
+
+        emit::emit!(rt: slot.get(), "test log", trace_id: "4bf92f3577b34da6a3ce929d0e0e4736", span_id: "00f067aa0ba902b7");
+
+        let logs = logs.get_emitted_logs().unwrap();
+
+        assert_eq!(1, logs.len());
+
+        assert_eq!(
+            "4bf92f3577b34da6a3ce929d0e0e4736",
+            logs[0].record.trace_context().unwrap().trace_id.to_string()
+        );
+        assert_eq!(
+            "00f067aa0ba902b7",
+            logs[0].record.trace_context().unwrap().span_id.to_string()
+        );
+    }
+
+    #[test]
     fn emit_span() {
         static SLOT: AmbientSlot = AmbientSlot::new();
         let (_, spans, _, _) = build(&SLOT);
@@ -1407,83 +2111,13 @@ mod tests {
     }
 
     #[test]
-    fn otel_span_emit_span() {
-        static SLOT: AmbientSlot = AmbientSlot::new();
-        let (_, spans, _, tracer_provider) = build(&SLOT);
-
-        fn otel_span(
-            tracer_provider: &SdkTracerProvider,
-        ) -> (opentelemetry::trace::SpanContext, emit::span::SpanCtxt) {
-            use opentelemetry::trace::TracerProvider;
-
-            #[emit::span(rt: SLOT.get(), "emit span")]
-            fn emit_span() -> emit::span::SpanCtxt {
-                emit::span::SpanCtxt::current(SLOT.get().ctxt())
-            }
-
-            tracer_provider
-                .tracer("otel_span")
-                .in_span("otel span", |cx| {
-                    (cx.span().span_context().clone(), emit_span())
-                })
-        }
-
-        let (otel_ctxt, emit_ctxt) = otel_span(&tracer_provider);
-
-        let spans = spans.get_finished_spans().unwrap();
-
-        assert_eq!(2, spans.len());
-
-        assert_eq!(
-            otel_ctxt.trace_id().to_bytes(),
-            emit_ctxt.trace_id().unwrap().to_bytes()
-        );
-
-        assert_eq!("emit span", spans[0].name);
-
-        assert_eq!(
-            emit_ctxt.trace_id().unwrap().to_bytes(),
-            spans[0].span_context.trace_id().to_bytes()
-        );
-        assert_eq!(
-            emit_ctxt.span_id().unwrap().to_bytes(),
-            spans[0].span_context.span_id().to_bytes()
-        );
-        assert_eq!(
-            emit_ctxt.span_parent().unwrap().to_bytes(),
-            spans[0].parent_span_id.to_bytes()
-        );
-        assert_eq!(
-            emit_ctxt.span_parent().unwrap().to_bytes(),
-            spans[1].span_context.span_id().to_bytes()
-        );
-
-        assert_eq!("otel span", spans[1].name);
-
-        assert_eq!(
-            otel_ctxt.trace_id().to_bytes(),
-            spans[1].span_context.trace_id().to_bytes()
-        );
-        assert_eq!(
-            otel_ctxt.span_id().to_bytes(),
-            spans[1].span_context.span_id().to_bytes()
-        );
-        assert_eq!(
-            opentelemetry::trace::SpanId::INVALID,
-            spans[1].parent_span_id
-        );
-    }
-
-    #[test]
     fn emit_span_otel_span() {
         static SLOT: AmbientSlot = AmbientSlot::new();
         let (_, spans, _, tracer_provider) = build(&SLOT);
 
         #[emit::span(rt: SLOT.get(), "emit span")]
-        fn emit_span(
-            tracer_provider: &SdkTracerProvider,
-        ) -> (opentelemetry::trace::SpanContext, emit::span::SpanCtxt) {
-            fn otel_span(tracer_provider: &SdkTracerProvider) -> opentelemetry::trace::SpanContext {
+        fn emit_span(tracer_provider: &SdkTracerProvider) -> (SpanContext, emit::span::SpanCtxt) {
+            fn otel_span(tracer_provider: &SdkTracerProvider) -> SpanContext {
                 use opentelemetry::trace::TracerProvider;
 
                 tracer_provider
@@ -1537,6 +2171,50 @@ mod tests {
     }
 
     #[test]
+    fn emit_span_otel_log() {
+        static SLOT: AmbientSlot = AmbientSlot::new();
+        let (logs, _, logger_provider, _) = build(&SLOT);
+
+        #[emit::span(rt: SLOT.get(), "emit span")]
+        fn emit_span(logger_provider: &SdkLoggerProvider) -> emit::span::SpanCtxt {
+            use opentelemetry::logs::LoggerProvider;
+
+            let logger = logger_provider.logger("otel_logger");
+
+            let mut log = logger.create_log_record();
+
+            log.set_body(AnyValue::String("test log".into()));
+
+            logger.emit(log);
+
+            emit::span::SpanCtxt::current(SLOT.get().ctxt())
+        }
+
+        let ctxt = emit_span(&logger_provider);
+
+        let logs = logs.get_emitted_logs().unwrap();
+
+        assert_eq!(1, logs.len());
+
+        assert!(logs[0]
+            .record
+            .trace_context()
+            .unwrap()
+            .trace_flags
+            .unwrap()
+            .is_sampled());
+
+        assert_eq!(
+            ctxt.trace_id().unwrap().to_bytes(),
+            logs[0].record.trace_context().unwrap().trace_id.to_bytes()
+        );
+        assert_eq!(
+            ctxt.span_id().unwrap().to_bytes(),
+            logs[0].record.trace_context().unwrap().span_id.to_bytes()
+        );
+    }
+
+    #[test]
     fn emit_span_span_name() {
         static SLOT: AmbientSlot = AmbientSlot::new();
         let (_, spans, _, _) = build(&SLOT);
@@ -1568,6 +2246,39 @@ mod tests {
         assert_eq!(1, spans.len());
 
         assert_eq!(SpanKind::Producer, spans[0].span_kind);
+    }
+
+    #[test]
+    fn emit_span_span_links() {
+        static SLOT: AmbientSlot = AmbientSlot::new();
+        let (_, spans, _, _) = build(&SLOT);
+
+        #[emit::span(
+            rt: SLOT.get(),
+            "emit span",
+            #[emit::as_serde]
+            span_links: [
+                "4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7",
+            ],
+        )]
+        fn emit_span() {}
+
+        emit_span();
+
+        let spans = spans.get_finished_spans().unwrap();
+
+        assert_eq!(1, spans.len());
+
+        assert_eq!(1, spans[0].links.links.len());
+
+        assert_eq!(
+            "4bf92f3577b34da6a3ce929d0e0e4736",
+            spans[0].links.links[0].span_context.trace_id().to_string()
+        );
+        assert_eq!(
+            "00f067aa0ba902b7",
+            spans[0].links.links[0].span_context.span_id().to_string()
+        );
     }
 
     #[test]
@@ -1628,11 +2339,207 @@ mod tests {
     }
 
     #[test]
+    fn emit_span_unsampled_otel_span() {
+        static SLOT: AmbientSlot = AmbientSlot::new();
+        let (_, spans, _, tracer_provider) = build(&SLOT);
+
+        #[emit::span(rt: SLOT.get(), when: emit::filter::from_fn(|_| false), "emit span")]
+        fn emit_span(tracer_provider: &SdkTracerProvider) -> SpanContext {
+            fn otel_span(tracer_provider: &SdkTracerProvider) -> SpanContext {
+                use opentelemetry::trace::TracerProvider;
+
+                tracer_provider
+                    .tracer("otel_span")
+                    .in_span("otel span", |cx| cx.span().span_context().clone())
+            }
+
+            otel_span(&tracer_provider)
+        }
+
+        let otel_ctxt = emit_span(&tracer_provider);
+
+        let spans = spans.get_finished_spans().unwrap();
+
+        assert_eq!(0, spans.len());
+
+        assert!(!otel_ctxt.is_sampled());
+    }
+
+    #[test]
+    fn emit_span_unsampled_emit_span() {
+        static SLOT: AmbientSlot = AmbientSlot::new();
+        let (_, spans, _, _) = build(&SLOT);
+
+        #[emit::span(rt: SLOT.get(), when: emit::filter::from_fn(|_| false), "emit span")]
+        fn emit_span_outer() {
+            #[emit::span(rt: SLOT.get(), "emit span")]
+            fn emit_span_inner() {}
+
+            emit_span_inner()
+        }
+
+        emit_span_outer();
+
+        let spans = spans.get_finished_spans().unwrap();
+
+        assert_eq!(0, spans.len());
+    }
+
+    #[test]
+    fn emit_span_unsampled_otel_log() {
+        static SLOT: AmbientSlot = AmbientSlot::new();
+        let (logs, _, logger_provider, _) = build(&SLOT);
+
+        #[emit::span(rt: SLOT.get(), when: emit::filter::from_fn(|_| false), "emit span")]
+        fn emit_span(logger_provider: &SdkLoggerProvider) -> emit::span::SpanCtxt {
+            use opentelemetry::logs::LoggerProvider;
+
+            let logger = logger_provider.logger("otel_logger");
+
+            let mut log = logger.create_log_record();
+
+            log.set_body(AnyValue::String("test log".into()));
+
+            logger.emit(log);
+
+            emit::span::SpanCtxt::current(SLOT.get().ctxt())
+        }
+
+        let ctxt = emit_span(&logger_provider);
+
+        let logs = logs.get_emitted_logs().unwrap();
+
+        assert_eq!(1, logs.len());
+
+        assert!(!logs[0]
+            .record
+            .trace_context()
+            .unwrap()
+            .trace_flags
+            .unwrap()
+            .is_sampled());
+
+        assert_eq!(
+            ctxt.trace_id().unwrap().to_bytes(),
+            logs[0].record.trace_context().unwrap().trace_id.to_bytes()
+        );
+        assert_eq!(
+            ctxt.span_id().unwrap().to_bytes(),
+            logs[0].record.trace_context().unwrap().span_id.to_bytes()
+        );
+    }
+
+    #[test]
+    fn emit_ctxt_clear_otel_ctxt() {
+        static SLOT: AmbientSlot = AmbientSlot::new();
+        let (_, _, _, tracer_provider) = build(&SLOT);
+
+        fn otel_span(tracer_provider: &SdkTracerProvider) -> SpanContext {
+            use opentelemetry::trace::TracerProvider;
+
+            tracer_provider
+                .tracer("otel_span")
+                .in_span("otel span", |_| {
+                    emit::Frame::root(SLOT.get().ctxt(), emit::Empty)
+                        .call(|| Context::current().span().span_context().clone())
+                })
+        }
+
+        let cx = otel_span(&tracer_provider);
+
+        assert_eq!(SpanContext::NONE, cx);
+    }
+
+    #[test]
+    fn emit_ctxt_push_otel_ctxt() {
+        static SLOT: AmbientSlot = AmbientSlot::new();
+        let (_, _, _, tracer_provider) = build(&SLOT);
+
+        fn otel_span(tracer_provider: &SdkTracerProvider) -> (SpanContext, SpanContext) {
+            use opentelemetry::trace::TracerProvider;
+
+            tracer_provider
+                .tracer("otel_span")
+                .in_span("otel span", |_| {
+                    let outer = Context::current().span().span_context().clone();
+
+                    let inner = emit::Frame::push(SLOT.get().ctxt(), emit::Empty)
+                        .call(|| Context::current().span().span_context().clone());
+
+                    (outer, inner)
+                })
+        }
+
+        let (outer, inner) = otel_span(&tracer_provider);
+
+        assert_eq!(outer.trace_id(), inner.trace_id());
+        assert_eq!(outer.span_id(), inner.span_id());
+        assert_eq!(outer.trace_flags(), inner.trace_flags());
+    }
+
+    #[test]
+    fn otel_span_emit_span() {
+        static SLOT: AmbientSlot = AmbientSlot::new();
+        let (_, spans, _, tracer_provider) = build(&SLOT);
+
+        fn otel_span(tracer_provider: &SdkTracerProvider) -> (SpanContext, emit::span::SpanCtxt) {
+            use opentelemetry::trace::TracerProvider;
+
+            #[emit::span(rt: SLOT.get(), "emit span")]
+            fn emit_span() -> emit::span::SpanCtxt {
+                emit::span::SpanCtxt::current(SLOT.get().ctxt())
+            }
+
+            tracer_provider
+                .tracer("otel_span")
+                .in_span("otel span", |cx| {
+                    (cx.span().span_context().clone(), emit_span())
+                })
+        }
+
+        let (otel_ctxt, emit_ctxt) = otel_span(&tracer_provider);
+
+        let spans = spans.get_finished_spans().unwrap();
+
+        assert_eq!(2, spans.len());
+
+        assert_eq!(
+            otel_ctxt.trace_id().to_bytes(),
+            emit_ctxt.trace_id().unwrap().to_bytes()
+        );
+
+        assert_eq!("emit span", spans[0].name);
+
+        assert_eq!(
+            emit_ctxt.trace_id().unwrap().to_bytes(),
+            spans[0].span_context.trace_id().to_bytes()
+        );
+        assert_eq!(
+            emit_ctxt.span_id().unwrap().to_bytes(),
+            spans[0].span_context.span_id().to_bytes()
+        );
+        assert!(emit_ctxt.span_parent().is_none(),);
+        assert!(emit_ctxt.span_parent().is_none(),);
+
+        assert_eq!("otel span", spans[1].name);
+
+        assert_eq!(
+            otel_ctxt.trace_id().to_bytes(),
+            spans[1].span_context.trace_id().to_bytes()
+        );
+        assert_eq!(
+            otel_ctxt.span_id().to_bytes(),
+            spans[1].span_context.span_id().to_bytes()
+        );
+        assert_eq!(SpanId::INVALID, spans[1].parent_span_id);
+    }
+
+    #[test]
     fn otel_span_emit_log() {
         static SLOT: AmbientSlot = AmbientSlot::new();
         let (logs, _, _, tracer_provider) = build(&SLOT);
 
-        fn otel_span(tracer_provider: &SdkTracerProvider) -> opentelemetry::trace::SpanContext {
+        fn otel_span(tracer_provider: &SdkTracerProvider) -> SpanContext {
             use opentelemetry::trace::TracerProvider;
 
             tracer_provider
@@ -1650,6 +2557,14 @@ mod tests {
 
         assert_eq!(1, logs.len());
 
+        assert!(logs[0]
+            .record
+            .trace_context()
+            .unwrap()
+            .trace_flags
+            .unwrap()
+            .is_sampled());
+
         assert_eq!(
             ctxt.trace_id(),
             logs[0].record.trace_context().unwrap().trace_id
@@ -1661,7 +2576,7 @@ mod tests {
     }
 
     #[test]
-    fn otel_span_unsampled() {
+    fn otel_span_unsampled_emit_span() {
         static SLOT: AmbientSlot = AmbientSlot::new();
         let (logs, spans, _, tracer_provider) = build(&SLOT);
 
@@ -1695,43 +2610,66 @@ mod tests {
         let logs = logs.get_emitted_logs().unwrap();
         let spans = spans.get_finished_spans().unwrap();
 
-        assert_eq!(0, logs.len());
+        assert_eq!(1, logs.len());
         assert_eq!(0, spans.len());
+
+        assert!(!logs[0]
+            .record
+            .trace_context()
+            .unwrap()
+            .trace_flags
+            .unwrap()
+            .is_sampled());
     }
 
     #[test]
-    fn emit_span_otel_log() {
+    fn otel_span_unsampled_emit_log() {
         static SLOT: AmbientSlot = AmbientSlot::new();
-        let (logs, _, logger_provider, _) = build(&SLOT);
+        let (logs, _, _, tracer_provider) = build(&SLOT);
 
-        #[emit::span(rt: SLOT.get(), "emit span")]
-        fn emit_span(logger_provider: &SdkLoggerProvider) -> emit::span::SpanCtxt {
-            use opentelemetry::logs::LoggerProvider;
+        fn otel_span(tracer_provider: &SdkTracerProvider) -> SpanContext {
+            use opentelemetry::trace::TracerProvider;
 
-            let logger = logger_provider.logger("otel_logger");
+            let tracer = tracer_provider.tracer("otel_span");
 
-            let mut log = logger.create_log_record();
+            let span = tracer.span_builder("otel span");
 
-            log.set_body(AnyValue::String("test log".into()));
+            let span = span
+                .with_sampling_result(SamplingResult {
+                    decision: SamplingDecision::Drop,
+                    attributes: vec![],
+                    trace_state: Default::default(),
+                })
+                .start(&tracer);
+            let cx = Context::current_with_span(span);
+            let _guard = cx.attach();
 
-            logger.emit(log);
+            emit::emit!(rt: SLOT.get(), "emit event");
 
-            emit::span::SpanCtxt::current(SLOT.get().ctxt())
+            Context::current().span().span_context().clone()
         }
 
-        let ctxt = emit_span(&logger_provider);
+        let ctxt = otel_span(&tracer_provider);
 
         let logs = logs.get_emitted_logs().unwrap();
 
         assert_eq!(1, logs.len());
 
+        assert!(!logs[0]
+            .record
+            .trace_context()
+            .unwrap()
+            .trace_flags
+            .unwrap()
+            .is_sampled());
+
         assert_eq!(
-            ctxt.trace_id().unwrap().to_bytes(),
-            logs[0].record.trace_context().unwrap().trace_id.to_bytes()
+            ctxt.trace_id(),
+            logs[0].record.trace_context().unwrap().trace_id
         );
         assert_eq!(
-            ctxt.span_id().unwrap().to_bytes(),
-            logs[0].record.trace_context().unwrap().span_id.to_bytes()
+            ctxt.span_id(),
+            logs[0].record.trace_context().unwrap().span_id
         );
     }
 
