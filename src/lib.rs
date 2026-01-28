@@ -146,8 +146,7 @@ Also see the [`opentelemetry`] docs for any details on getting diagnostics out o
 #![doc(html_logo_url = "https://raw.githubusercontent.com/emit-rs/emit/main/asset/logo.svg")]
 #![deny(missing_docs)]
 
-use std::{borrow::Cow, cell::RefCell, fmt, ops::ControlFlow, sync::Arc};
-
+use emit::well_known::KEY_SPAN_LINKS;
 use emit::{
     well_known::{
         KEY_ERR, KEY_EVT_KIND, KEY_LVL, KEY_SPAN_ID, KEY_SPAN_KIND, KEY_SPAN_NAME, KEY_SPAN_PARENT,
@@ -155,14 +154,16 @@ use emit::{
     },
     Filter, Props,
 };
-
+use opentelemetry::trace::{Link, SamplingDecision, SamplingResult, TraceState};
 use opentelemetry::{
     logs::{AnyValue, LogRecord, Logger, LoggerProvider, Severity},
     trace::{
         SpanContext, SpanId, SpanKind, Status, TraceContextExt, TraceId, Tracer, TracerProvider,
     },
-    Context, ContextGuard, Key, KeyValue, Value,
+    Context, ContextGuard, Key, KeyValue, TraceFlags, Value,
 };
+use std::fmt::{Display, Formatter};
+use std::{borrow::Cow, cell::RefCell, fmt, ops::ControlFlow, sync::Arc};
 
 mod internal_metrics;
 
@@ -535,6 +536,18 @@ where
     // Note that only properties that are needed on span construction are
     // handled here. Other span properties will be mapped when the span is emitted
 
+    let span_links = props
+        .get(KEY_SPAN_LINKS)
+        .map(|links| {
+            otel_span_links(
+                links,
+                ctxt.span().span_context().trace_flags(),
+                ctxt.span().span_context().is_remote(),
+                ctxt.span().span_context().trace_state(),
+            )
+        })
+        .unwrap_or_default();
+
     let span_kind = props
         .pull::<emit::span::SpanKind, _>(KEY_SPAN_KIND)
         .map(|kind| match kind {
@@ -566,12 +579,16 @@ where
         span = span.with_trace_id(trace_id);
     }
 
+    span = span.with_links(span_links);
+
     // If the context was discarded by `emit`'s filter then open it as disabled
-    let ctxt = if suppress {
-        ctxt.with_telemetry_suppressed()
-    } else {
-        ctxt
-    };
+    if suppress {
+        span = span.with_sampling_result(SamplingResult {
+            decision: SamplingDecision::Drop,
+            attributes: vec![],
+            trace_state: Default::default(),
+        });
+    }
 
     let ctxt = ctxt.with_span(span.start(tracer));
 
@@ -608,9 +625,8 @@ impl<P: emit::Props> emit::Props for ExcludeSpanCtxtProps<P> {
     ) -> ControlFlow<()> {
         self.inner.for_each(|key, value| match key.get() {
             // Properties that come from the OTel context
-            KEY_TRACE_ID | KEY_SPAN_ID | KEY_SPAN_PARENT | KEY_SPAN_NAME | KEY_SPAN_KIND => {
-                ControlFlow::Continue(())
-            }
+            KEY_TRACE_ID | KEY_SPAN_ID | KEY_SPAN_PARENT | KEY_SPAN_NAME | KEY_SPAN_KIND
+            | KEY_SPAN_LINKS => ControlFlow::Continue(()),
             // Properties to pass through to the underlying context
             _ => for_each(key, value),
         })
@@ -746,6 +762,7 @@ impl<L: Logger> emit::Emitter for OpenTelemetryEmitter<L> {
                     if Some(span_id) == evt_span_id {
                         let mut status = Status::Ok;
                         let mut status_is_descriptive_err = false;
+                        let mut span_links = Vec::new();
 
                         let _ = evt.props().for_each(|k, v| {
                             if k == KEY_LVL {
@@ -767,6 +784,17 @@ impl<L: Logger> emit::Emitter for OpenTelemetryEmitter<L> {
 
                                 status = Status::error(v.to_string());
                                 status_is_descriptive_err = true;
+
+                                return ControlFlow::Continue(());
+                            }
+
+                            if k == KEY_SPAN_LINKS {
+                                span_links = otel_span_links(
+                                    v,
+                                    span.span_context().trace_flags(),
+                                    span.span_context().is_remote(),
+                                    span.span_context().trace_state(),
+                                );
 
                                 return ControlFlow::Continue(());
                             }
@@ -800,6 +828,10 @@ impl<L: Logger> emit::Emitter for OpenTelemetryEmitter<L> {
                         }
 
                         span.set_status(status);
+
+                        for link in span_links {
+                            span.add_link(link.span_context, Default::default());
+                        }
 
                         if let Some(extent) = evt.extent().and_then(|ex| ex.as_range()) {
                             span.end_with_timestamp(extent.end.to_system_time());
@@ -887,7 +919,7 @@ impl<L: Logger> emit::Emitter for OpenTelemetryEmitter<L> {
                 }
 
                 // Ignored
-                if k == KEY_SPAN_NAME || k == KEY_SPAN_KIND {
+                if k == KEY_SPAN_NAME || k == KEY_SPAN_KIND || k == KEY_SPAN_LINKS {
                     return ControlFlow::Continue(());
                 }
 
@@ -905,10 +937,15 @@ impl<L: Logger> emit::Emitter for OpenTelemetryEmitter<L> {
             record.set_timestamp(extent.as_point().to_system_time());
         }
 
-        // NOTE: We don't currently have a way to set these on a generic `impl LogRecord`
-        // The record will use whatever is on the OpenTelemetry context stack.
-        // We should possibly enter a span just for the sake of logging here
-        let _ = (trace_id, span_id);
+        let context = Context::current();
+        let span = context.span();
+        let span = span.span_context();
+
+        let trace_id = trace_id.unwrap_or_else(|| span.trace_id());
+        let span_id = span_id.unwrap_or_else(|| span.span_id());
+        let trace_flags = Some(span.trace_flags());
+
+        record.set_trace_context(trace_id, span_id, trace_flags);
 
         self.logger.emit(record);
     }
@@ -971,6 +1008,498 @@ fn otel_log_value(v: emit::Value) -> Option<AnyValue> {
     }
 }
 
+fn otel_span_links(
+    v: emit::Value,
+    trace_flags: TraceFlags,
+    is_remote: bool,
+    trace_state: &TraceState,
+) -> Vec<Link> {
+    // A `serde::Serializer` that extracts span links in `emit`'s `["{traceid}-{spanid}"]`
+    // format and converts them into OpenTelemetry links
+
+    use serde::ser::{
+        Error, Impossible, Serialize, SerializeSeq, SerializeTuple, SerializeTupleStruct,
+        SerializeTupleVariant, Serializer, StdError,
+    };
+
+    struct Extract<'a> {
+        links: Vec<Link>,
+        trace_flags: TraceFlags,
+        is_remote: bool,
+        trace_state: &'a TraceState,
+    }
+
+    #[derive(Debug)]
+    struct ExtractError;
+
+    impl fmt::Display for ExtractError {
+        fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+            f.write_str("unsupported value for span links")
+        }
+    }
+
+    impl StdError for ExtractError {}
+
+    impl Error for ExtractError {
+        fn custom<T>(_: T) -> Self
+        where
+            T: Display,
+        {
+            ExtractError
+        }
+    }
+
+    impl<'a> Serializer for Extract<'a> {
+        type Ok = Vec<Link>;
+        type Error = ExtractError;
+        type SerializeSeq = Self;
+        type SerializeTuple = Self;
+        type SerializeTupleStruct = Self;
+        type SerializeTupleVariant = Self;
+        type SerializeMap = Impossible<Self::Ok, Self::Error>;
+        type SerializeStruct = Impossible<Self::Ok, Self::Error>;
+        type SerializeStructVariant = Impossible<Self::Ok, Self::Error>;
+
+        fn serialize_bool(self, _: bool) -> Result<Self::Ok, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_i8(self, _: i8) -> Result<Self::Ok, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_i16(self, _: i16) -> Result<Self::Ok, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_i32(self, _: i32) -> Result<Self::Ok, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_i64(self, _: i64) -> Result<Self::Ok, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_u8(self, _: u8) -> Result<Self::Ok, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_u16(self, _: u16) -> Result<Self::Ok, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_u32(self, _: u32) -> Result<Self::Ok, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_u64(self, _: u64) -> Result<Self::Ok, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_f32(self, _: f32) -> Result<Self::Ok, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_f64(self, _: f64) -> Result<Self::Ok, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_char(self, _: char) -> Result<Self::Ok, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_str(self, _: &str) -> Result<Self::Ok, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_bytes(self, _: &[u8]) -> Result<Self::Ok, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_none(self) -> Result<Self::Ok, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_some<T>(self, value: &T) -> Result<Self::Ok, Self::Error>
+        where
+            T: ?Sized + Serialize,
+        {
+            value.serialize(self)
+        }
+
+        fn serialize_unit(self) -> Result<Self::Ok, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_unit_struct(self, _: &'static str) -> Result<Self::Ok, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_unit_variant(
+            self,
+            _: &'static str,
+            _: u32,
+            _: &'static str,
+        ) -> Result<Self::Ok, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_newtype_struct<T>(
+            self,
+            _: &'static str,
+            value: &T,
+        ) -> Result<Self::Ok, Self::Error>
+        where
+            T: ?Sized + Serialize,
+        {
+            value.serialize(self)
+        }
+
+        fn serialize_newtype_variant<T>(
+            self,
+            _: &'static str,
+            _: u32,
+            _: &'static str,
+            value: &T,
+        ) -> Result<Self::Ok, Self::Error>
+        where
+            T: ?Sized + Serialize,
+        {
+            value.serialize(self)
+        }
+
+        fn serialize_seq(self, _: Option<usize>) -> Result<Self::SerializeSeq, Self::Error> {
+            Ok(self)
+        }
+
+        fn serialize_tuple(self, _: usize) -> Result<Self::SerializeTuple, Self::Error> {
+            Ok(self)
+        }
+
+        fn serialize_tuple_struct(
+            self,
+            _: &'static str,
+            _: usize,
+        ) -> Result<Self::SerializeTupleStruct, Self::Error> {
+            Ok(self)
+        }
+
+        fn serialize_tuple_variant(
+            self,
+            _: &'static str,
+            _: u32,
+            _: &'static str,
+            _: usize,
+        ) -> Result<Self::SerializeTupleVariant, Self::Error> {
+            Ok(self)
+        }
+
+        fn serialize_map(self, _: Option<usize>) -> Result<Self::SerializeMap, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_struct(
+            self,
+            _: &'static str,
+            _: usize,
+        ) -> Result<Self::SerializeStruct, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_struct_variant(
+            self,
+            _: &'static str,
+            _: u32,
+            _: &'static str,
+            _: usize,
+        ) -> Result<Self::SerializeStructVariant, Self::Error> {
+            Err(ExtractError)
+        }
+    }
+
+    impl<'a> SerializeSeq for Extract<'a> {
+        type Ok = Vec<Link>;
+        type Error = ExtractError;
+
+        fn serialize_element<T>(&mut self, value: &T) -> Result<(), Self::Error>
+        where
+            T: ?Sized + Serialize,
+        {
+            self.links.push(value.serialize(ParseLink {
+                trace_flags: self.trace_flags,
+                is_remote: self.is_remote,
+                trace_state: self.trace_state,
+            })?);
+
+            Ok(())
+        }
+
+        fn end(self) -> Result<Self::Ok, Self::Error> {
+            Ok(self.links)
+        }
+    }
+
+    impl<'a> SerializeTuple for Extract<'a> {
+        type Ok = Vec<Link>;
+        type Error = ExtractError;
+
+        fn serialize_element<T>(&mut self, value: &T) -> Result<(), Self::Error>
+        where
+            T: ?Sized + Serialize,
+        {
+            self.links.push(value.serialize(ParseLink {
+                trace_flags: self.trace_flags,
+                is_remote: self.is_remote,
+                trace_state: self.trace_state,
+            })?);
+
+            Ok(())
+        }
+
+        fn end(self) -> Result<Self::Ok, Self::Error> {
+            Ok(self.links)
+        }
+    }
+
+    impl<'a> SerializeTupleStruct for Extract<'a> {
+        type Ok = Vec<Link>;
+        type Error = ExtractError;
+
+        fn serialize_field<T>(&mut self, value: &T) -> Result<(), Self::Error>
+        where
+            T: ?Sized + Serialize,
+        {
+            self.links.push(value.serialize(ParseLink {
+                trace_flags: self.trace_flags,
+                is_remote: self.is_remote,
+                trace_state: self.trace_state,
+            })?);
+
+            Ok(())
+        }
+
+        fn end(self) -> Result<Self::Ok, Self::Error> {
+            Ok(self.links)
+        }
+    }
+
+    impl<'a> SerializeTupleVariant for Extract<'a> {
+        type Ok = Vec<Link>;
+        type Error = ExtractError;
+
+        fn serialize_field<T>(&mut self, value: &T) -> Result<(), Self::Error>
+        where
+            T: ?Sized + Serialize,
+        {
+            self.links.push(value.serialize(ParseLink {
+                trace_flags: self.trace_flags,
+                is_remote: self.is_remote,
+                trace_state: &self.trace_state,
+            })?);
+
+            Ok(())
+        }
+
+        fn end(self) -> Result<Self::Ok, Self::Error> {
+            Ok(self.links)
+        }
+    }
+
+    struct ParseLink<'a> {
+        trace_flags: TraceFlags,
+        is_remote: bool,
+        trace_state: &'a TraceState,
+    }
+
+    impl<'a> Serializer for ParseLink<'a> {
+        type Ok = Link;
+        type Error = ExtractError;
+        type SerializeSeq = Impossible<Self::Ok, Self::Error>;
+        type SerializeTuple = Impossible<Self::Ok, Self::Error>;
+        type SerializeTupleStruct = Impossible<Self::Ok, Self::Error>;
+        type SerializeTupleVariant = Impossible<Self::Ok, Self::Error>;
+        type SerializeMap = Impossible<Self::Ok, Self::Error>;
+        type SerializeStruct = Impossible<Self::Ok, Self::Error>;
+        type SerializeStructVariant = Impossible<Self::Ok, Self::Error>;
+
+        fn serialize_bool(self, _: bool) -> Result<Self::Ok, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_i8(self, _: i8) -> Result<Self::Ok, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_i16(self, _: i16) -> Result<Self::Ok, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_i32(self, _: i32) -> Result<Self::Ok, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_i64(self, _: i64) -> Result<Self::Ok, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_u8(self, _: u8) -> Result<Self::Ok, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_u16(self, _: u16) -> Result<Self::Ok, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_u32(self, _: u32) -> Result<Self::Ok, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_u64(self, _: u64) -> Result<Self::Ok, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_f32(self, _: f32) -> Result<Self::Ok, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_f64(self, _: f64) -> Result<Self::Ok, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_char(self, _: char) -> Result<Self::Ok, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_str(self, v: &str) -> Result<Self::Ok, Self::Error> {
+            let link = emit::span::SpanLink::try_from_str(v).map_err(|_| ExtractError)?;
+
+            Ok(Link::new(
+                SpanContext::new(
+                    otel_trace_id(*link.trace_id()),
+                    otel_span_id(*link.span_id()),
+                    self.trace_flags,
+                    self.is_remote,
+                    self.trace_state.clone(),
+                ),
+                Vec::new(),
+                0,
+            ))
+        }
+
+        fn serialize_bytes(self, _: &[u8]) -> Result<Self::Ok, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_none(self) -> Result<Self::Ok, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_some<T>(self, value: &T) -> Result<Self::Ok, Self::Error>
+        where
+            T: ?Sized + Serialize,
+        {
+            value.serialize(self)
+        }
+
+        fn serialize_unit(self) -> Result<Self::Ok, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_unit_struct(self, _: &'static str) -> Result<Self::Ok, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_unit_variant(
+            self,
+            _: &'static str,
+            _: u32,
+            _: &'static str,
+        ) -> Result<Self::Ok, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_newtype_struct<T>(
+            self,
+            _: &'static str,
+            value: &T,
+        ) -> Result<Self::Ok, Self::Error>
+        where
+            T: ?Sized + Serialize,
+        {
+            value.serialize(self)
+        }
+
+        fn serialize_newtype_variant<T>(
+            self,
+            _: &'static str,
+            _: u32,
+            _: &'static str,
+            value: &T,
+        ) -> Result<Self::Ok, Self::Error>
+        where
+            T: ?Sized + Serialize,
+        {
+            value.serialize(self)
+        }
+
+        fn serialize_seq(self, _: Option<usize>) -> Result<Self::SerializeSeq, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_tuple(self, _: usize) -> Result<Self::SerializeTuple, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_tuple_struct(
+            self,
+            _: &'static str,
+            _: usize,
+        ) -> Result<Self::SerializeTupleStruct, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_tuple_variant(
+            self,
+            _: &'static str,
+            _: u32,
+            _: &'static str,
+            _: usize,
+        ) -> Result<Self::SerializeTupleVariant, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_map(self, _: Option<usize>) -> Result<Self::SerializeMap, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_struct(
+            self,
+            _: &'static str,
+            _: usize,
+        ) -> Result<Self::SerializeStruct, Self::Error> {
+            Err(ExtractError)
+        }
+
+        fn serialize_struct_variant(
+            self,
+            _: &'static str,
+            _: u32,
+            _: &'static str,
+            _: usize,
+        ) -> Result<Self::SerializeStructVariant, Self::Error> {
+            Err(ExtractError)
+        }
+    }
+
+    v.serialize(Extract {
+        links: Vec::new(),
+        trace_flags,
+        is_remote,
+        trace_state,
+    })
+    .unwrap_or_default()
+}
+
 mod any_value {
     use std::{collections::HashMap, fmt};
 
@@ -988,7 +1517,7 @@ mod any_value {
     /// - Unit types and nones are discarded (effectively treated as undefined).
     /// - Struct and tuple variants are converted into an internally tagged map.
     /// - Unit variants are converted into strings.
-    pub(crate) fn serialize(value: impl serde::Serialize) -> Result<Option<AnyValue>, ()> {
+    pub(crate) fn serialize(value: impl Serialize) -> Result<Option<AnyValue>, ()> {
         value.serialize(ValueSerializer).map_err(|_| ())
     }
 
@@ -1496,6 +2025,27 @@ mod tests {
     }
 
     #[test]
+    fn emit_log_trace_context() {
+        let slot = AmbientSlot::new();
+        let (logs, _, _, _) = build(&slot);
+
+        emit::emit!(rt: slot.get(), "test log", trace_id: "4bf92f3577b34da6a3ce929d0e0e4736", span_id: "00f067aa0ba902b7");
+
+        let logs = logs.get_emitted_logs().unwrap();
+
+        assert_eq!(1, logs.len());
+
+        assert_eq!(
+            "4bf92f3577b34da6a3ce929d0e0e4736",
+            logs[0].record.trace_context().unwrap().trace_id.to_string()
+        );
+        assert_eq!(
+            "00f067aa0ba902b7",
+            logs[0].record.trace_context().unwrap().span_id.to_string()
+        );
+    }
+
+    #[test]
     fn emit_span() {
         static SLOT: AmbientSlot = AmbientSlot::new();
         let (_, spans, _, _) = build(&SLOT);
@@ -1556,10 +2106,8 @@ mod tests {
         let (_, spans, _, tracer_provider) = build(&SLOT);
 
         #[emit::span(rt: SLOT.get(), "emit span")]
-        fn emit_span(
-            tracer_provider: &SdkTracerProvider,
-        ) -> (opentelemetry::trace::SpanContext, emit::span::SpanCtxt) {
-            fn otel_span(tracer_provider: &SdkTracerProvider) -> opentelemetry::trace::SpanContext {
+        fn emit_span(tracer_provider: &SdkTracerProvider) -> (SpanContext, emit::span::SpanCtxt) {
+            fn otel_span(tracer_provider: &SdkTracerProvider) -> SpanContext {
                 use opentelemetry::trace::TracerProvider;
 
                 tracer_provider
@@ -1638,6 +2186,14 @@ mod tests {
 
         assert_eq!(1, logs.len());
 
+        assert!(logs[0]
+            .record
+            .trace_context()
+            .unwrap()
+            .trace_flags
+            .unwrap()
+            .is_sampled());
+
         assert_eq!(
             ctxt.trace_id().unwrap().to_bytes(),
             logs[0].record.trace_context().unwrap().trace_id.to_bytes()
@@ -1680,6 +2236,39 @@ mod tests {
         assert_eq!(1, spans.len());
 
         assert_eq!(SpanKind::Producer, spans[0].span_kind);
+    }
+
+    #[test]
+    fn emit_span_span_links() {
+        static SLOT: AmbientSlot = AmbientSlot::new();
+        let (_, spans, _, _) = build(&SLOT);
+
+        #[emit::span(
+            rt: SLOT.get(),
+            "emit span",
+            #[emit::as_serde]
+            span_links: [
+                "4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7",
+            ],
+        )]
+        fn emit_span() {}
+
+        emit_span();
+
+        let spans = spans.get_finished_spans().unwrap();
+
+        assert_eq!(1, spans.len());
+
+        assert_eq!(1, spans[0].links.links.len());
+
+        assert_eq!(
+            "4bf92f3577b34da6a3ce929d0e0e4736",
+            spans[0].links.links[0].span_context.trace_id().to_string()
+        );
+        assert_eq!(
+            "00f067aa0ba902b7",
+            spans[0].links.links[0].span_context.span_id().to_string()
+        );
     }
 
     #[test]
@@ -1740,24 +2329,142 @@ mod tests {
     }
 
     #[test]
-    fn emit_span_unsampled() {
-        // TODO: Based on `open_disabled`
-        todo!()
+    fn emit_span_unsampled_otel_span() {
+        static SLOT: AmbientSlot = AmbientSlot::new();
+        let (_, spans, _, tracer_provider) = build(&SLOT);
+
+        #[emit::span(rt: SLOT.get(), when: emit::filter::from_fn(|_| false), "emit span")]
+        fn emit_span(tracer_provider: &SdkTracerProvider) -> SpanContext {
+            fn otel_span(tracer_provider: &SdkTracerProvider) -> SpanContext {
+                use opentelemetry::trace::TracerProvider;
+
+                tracer_provider
+                    .tracer("otel_span")
+                    .in_span("otel span", |cx| cx.span().span_context().clone())
+            }
+
+            otel_span(&tracer_provider)
+        }
+
+        let otel_ctxt = emit_span(&tracer_provider);
+
+        let spans = spans.get_finished_spans().unwrap();
+
+        assert_eq!(0, spans.len());
+
+        assert!(!otel_ctxt.is_sampled());
     }
 
     #[test]
-    fn emit_span_kind() {
-        todo!()
+    fn emit_span_unsampled_emit_span() {
+        static SLOT: AmbientSlot = AmbientSlot::new();
+        let (_, spans, _, _) = build(&SLOT);
+
+        #[emit::span(rt: SLOT.get(), when: emit::filter::from_fn(|_| false), "emit span")]
+        fn emit_span_outer() {
+            #[emit::span(rt: SLOT.get(), "emit span")]
+            fn emit_span_inner() {}
+
+            emit_span_inner()
+        }
+
+        emit_span_outer();
+
+        let spans = spans.get_finished_spans().unwrap();
+
+        assert_eq!(0, spans.len());
     }
 
     #[test]
-    fn emit_span_links() {
-        todo!()
+    fn emit_span_unsampled_otel_log() {
+        static SLOT: AmbientSlot = AmbientSlot::new();
+        let (logs, _, logger_provider, _) = build(&SLOT);
+
+        #[emit::span(rt: SLOT.get(), when: emit::filter::from_fn(|_| false), "emit span")]
+        fn emit_span(logger_provider: &SdkLoggerProvider) -> emit::span::SpanCtxt {
+            use opentelemetry::logs::LoggerProvider;
+
+            let logger = logger_provider.logger("otel_logger");
+
+            let mut log = logger.create_log_record();
+
+            log.set_body(AnyValue::String("test log".into()));
+
+            logger.emit(log);
+
+            emit::span::SpanCtxt::current(SLOT.get().ctxt())
+        }
+
+        let ctxt = emit_span(&logger_provider);
+
+        let logs = logs.get_emitted_logs().unwrap();
+
+        assert_eq!(1, logs.len());
+
+        assert!(!logs[0]
+            .record
+            .trace_context()
+            .unwrap()
+            .trace_flags
+            .unwrap()
+            .is_sampled());
+
+        assert_eq!(
+            ctxt.trace_id().unwrap().to_bytes(),
+            logs[0].record.trace_context().unwrap().trace_id.to_bytes()
+        );
+        assert_eq!(
+            ctxt.span_id().unwrap().to_bytes(),
+            logs[0].record.trace_context().unwrap().span_id.to_bytes()
+        );
     }
 
     #[test]
-    fn emit_propagate_across_threads() {
-        todo!()
+    fn emit_ctxt_clear_otel_ctxt() {
+        static SLOT: AmbientSlot = AmbientSlot::new();
+        let (_, _, _, tracer_provider) = build(&SLOT);
+
+        fn otel_span(tracer_provider: &SdkTracerProvider) -> SpanContext {
+            use opentelemetry::trace::TracerProvider;
+
+            tracer_provider
+                .tracer("otel_span")
+                .in_span("otel span", |_| {
+                    emit::Frame::root(SLOT.get().ctxt(), emit::Empty)
+                        .call(|| Context::current().span().span_context().clone())
+                })
+        }
+
+        let cx = otel_span(&tracer_provider);
+
+        assert_eq!(SpanContext::NONE, cx);
+    }
+
+    #[test]
+    fn emit_ctxt_push_otel_ctxt() {
+        static SLOT: AmbientSlot = AmbientSlot::new();
+        let (_, _, _, tracer_provider) = build(&SLOT);
+
+        fn otel_span(tracer_provider: &SdkTracerProvider) -> (SpanContext, SpanContext) {
+            use opentelemetry::trace::TracerProvider;
+
+            tracer_provider
+                .tracer("otel_span")
+                .in_span("otel span", |_| {
+                    let outer = Context::current().span().span_context().clone();
+
+                    let inner = emit::Frame::push(SLOT.get().ctxt(), emit::Empty)
+                        .call(|| Context::current().span().span_context().clone());
+
+                    (outer, inner)
+                })
+        }
+
+        let (outer, inner) = otel_span(&tracer_provider);
+
+        assert_eq!(outer.trace_id(), inner.trace_id());
+        assert_eq!(outer.span_id(), inner.span_id());
+        assert_eq!(outer.trace_flags(), inner.trace_flags());
     }
 
     #[test]
@@ -1765,9 +2472,7 @@ mod tests {
         static SLOT: AmbientSlot = AmbientSlot::new();
         let (_, spans, _, tracer_provider) = build(&SLOT);
 
-        fn otel_span(
-            tracer_provider: &SdkTracerProvider,
-        ) -> (opentelemetry::trace::SpanContext, emit::span::SpanCtxt) {
+        fn otel_span(tracer_provider: &SdkTracerProvider) -> (SpanContext, emit::span::SpanCtxt) {
             use opentelemetry::trace::TracerProvider;
 
             #[emit::span(rt: SLOT.get(), "emit span")]
@@ -1816,10 +2521,7 @@ mod tests {
             otel_ctxt.span_id().to_bytes(),
             spans[1].span_context.span_id().to_bytes()
         );
-        assert_eq!(
-            opentelemetry::trace::SpanId::INVALID,
-            spans[1].parent_span_id
-        );
+        assert_eq!(SpanId::INVALID, spans[1].parent_span_id);
     }
 
     #[test]
@@ -1827,7 +2529,7 @@ mod tests {
         static SLOT: AmbientSlot = AmbientSlot::new();
         let (logs, _, _, tracer_provider) = build(&SLOT);
 
-        fn otel_span(tracer_provider: &SdkTracerProvider) -> opentelemetry::trace::SpanContext {
+        fn otel_span(tracer_provider: &SdkTracerProvider) -> SpanContext {
             use opentelemetry::trace::TracerProvider;
 
             tracer_provider
@@ -1845,6 +2547,14 @@ mod tests {
 
         assert_eq!(1, logs.len());
 
+        assert!(logs[0]
+            .record
+            .trace_context()
+            .unwrap()
+            .trace_flags
+            .unwrap()
+            .is_sampled());
+
         assert_eq!(
             ctxt.trace_id(),
             logs[0].record.trace_context().unwrap().trace_id
@@ -1856,7 +2566,7 @@ mod tests {
     }
 
     #[test]
-    fn otel_span_unsampled() {
+    fn otel_span_unsampled_emit_span() {
         static SLOT: AmbientSlot = AmbientSlot::new();
         let (logs, spans, _, tracer_provider) = build(&SLOT);
 
@@ -1890,13 +2600,67 @@ mod tests {
         let logs = logs.get_emitted_logs().unwrap();
         let spans = spans.get_finished_spans().unwrap();
 
-        assert_eq!(0, logs.len());
+        assert_eq!(1, logs.len());
         assert_eq!(0, spans.len());
+
+        assert!(!logs[0]
+            .record
+            .trace_context()
+            .unwrap()
+            .trace_flags
+            .unwrap()
+            .is_sampled());
     }
 
     #[test]
-    fn otel_propagate_across_threads() {
-        todo!()
+    fn otel_span_unsampled_emit_log() {
+        static SLOT: AmbientSlot = AmbientSlot::new();
+        let (logs, _, _, tracer_provider) = build(&SLOT);
+
+        fn otel_span(tracer_provider: &SdkTracerProvider) -> SpanContext {
+            use opentelemetry::trace::TracerProvider;
+
+            let tracer = tracer_provider.tracer("otel_span");
+
+            let span = tracer.span_builder("otel span");
+
+            let span = span
+                .with_sampling_result(SamplingResult {
+                    decision: SamplingDecision::Drop,
+                    attributes: vec![],
+                    trace_state: Default::default(),
+                })
+                .start(&tracer);
+            let cx = Context::current_with_span(span);
+            let _guard = cx.attach();
+
+            emit::emit!(rt: SLOT.get(), "emit event");
+
+            Context::current().span().span_context().clone()
+        }
+
+        let ctxt = otel_span(&tracer_provider);
+
+        let logs = logs.get_emitted_logs().unwrap();
+
+        assert_eq!(1, logs.len());
+
+        assert!(!logs[0]
+            .record
+            .trace_context()
+            .unwrap()
+            .trace_flags
+            .unwrap()
+            .is_sampled());
+
+        assert_eq!(
+            ctxt.trace_id(),
+            logs[0].record.trace_context().unwrap().trace_id
+        );
+        assert_eq!(
+            ctxt.span_id(),
+            logs[0].record.trace_context().unwrap().span_id
+        );
     }
 
     #[test]
