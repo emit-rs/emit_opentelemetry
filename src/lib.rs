@@ -159,13 +159,12 @@ Also see the [`opentelemetry`] docs for any details on getting diagnostics out o
 #![doc(html_logo_url = "https://raw.githubusercontent.com/emit-rs/emit/main/asset/logo.svg")]
 #![deny(missing_docs)]
 
-use emit::well_known::KEY_SPAN_LINKS;
 use emit::{
     well_known::{
-        KEY_ERR, KEY_EVT_KIND, KEY_LVL, KEY_SPAN_ID, KEY_SPAN_KIND, KEY_SPAN_NAME, KEY_SPAN_PARENT,
-        KEY_TRACE_ID, LVL_DEBUG, LVL_ERROR, LVL_INFO, LVL_WARN,
+        KEY_ERR, KEY_EVT_KIND, KEY_LVL, KEY_SPAN_ID, KEY_SPAN_KIND, KEY_SPAN_LINKS, KEY_SPAN_NAME,
+        KEY_SPAN_PARENT, KEY_TRACE_ID, LVL_DEBUG, LVL_ERROR, LVL_INFO, LVL_WARN,
     },
-    Filter, Props,
+    Filter as _, Props as _,
 };
 use opentelemetry::trace::{Link, SamplingDecision, SamplingResult, TraceState};
 use opentelemetry::{
@@ -175,7 +174,7 @@ use opentelemetry::{
     },
     Context, ContextGuard, Key, KeyValue, TraceFlags, Value,
 };
-use std::fmt::{Display, Formatter};
+
 use std::{borrow::Cow, cell::RefCell, fmt, ops::ControlFlow, sync::Arc};
 
 mod internal_metrics;
@@ -345,7 +344,7 @@ impl<P: emit::Props + ?Sized> emit::Props for OpenTelemetryProps<P> {
         // so inner it's guaranteed to be valid for `'kv`, which must be shorter than its
         // original lifetime
         unsafe { &*self.inner }.for_each(|k, v| {
-            if k != emit::well_known::KEY_TRACE_ID && k != emit::well_known::KEY_SPAN_ID {
+            if k != KEY_TRACE_ID && k != KEY_SPAN_ID {
                 for_each(k, v)?;
             }
 
@@ -407,7 +406,7 @@ where
         }
     }
 
-    fn open_disabled<P: Props>(&self, props: P) -> Self::Frame {
+    fn open_disabled<P: emit::Props>(&self, props: P) -> Self::Frame {
         let (incoming, props) = incoming_span_ctxt(&self.tracer, props, true);
 
         let (slot, options) = match incoming {
@@ -426,7 +425,7 @@ where
         }
     }
 
-    fn open_push<P: Props>(&self, props: P) -> Self::Frame {
+    fn open_push<P: emit::Props>(&self, props: P) -> Self::Frame {
         let (incoming, props) = incoming_span_ctxt(&self.tracer, props, false);
 
         let (slot, options) = match incoming {
@@ -520,7 +519,7 @@ fn incoming_span_ctxt<T: Tracer>(
     tracer: &T,
     props: impl emit::Props,
     suppress: bool,
-) -> (IncomingSpanCtxt, impl Props)
+) -> (IncomingSpanCtxt, impl emit::Props)
 where
     T::Span: Send + Sync + 'static,
 {
@@ -1046,7 +1045,7 @@ fn otel_span_links(
     struct ExtractError;
 
     impl fmt::Display for ExtractError {
-        fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             f.write_str("unsupported value for span links")
         }
     }
@@ -1056,7 +1055,7 @@ fn otel_span_links(
     impl Error for ExtractError {
         fn custom<T>(_: T) -> Self
         where
-            T: Display,
+            T: fmt::Display,
         {
             ExtractError
         }
@@ -1686,10 +1685,7 @@ mod any_value {
             Ok(None)
         }
 
-        fn serialize_some<T: serde::Serialize + ?Sized>(
-            self,
-            value: &T,
-        ) -> Result<Self::Ok, Self::Error> {
+        fn serialize_some<T: Serialize + ?Sized>(self, value: &T) -> Result<Self::Ok, Self::Error> {
             value.serialize(self)
         }
 
@@ -1710,7 +1706,7 @@ mod any_value {
             variant.serialize(self)
         }
 
-        fn serialize_newtype_struct<T: serde::Serialize + ?Sized>(
+        fn serialize_newtype_struct<T: Serialize + ?Sized>(
             self,
             _: &'static str,
             value: &T,
@@ -1718,7 +1714,7 @@ mod any_value {
             value.serialize(self)
         }
 
-        fn serialize_newtype_variant<T: serde::Serialize + ?Sized>(
+        fn serialize_newtype_variant<T: Serialize + ?Sized>(
             self,
             _: &'static str,
             _: u32,
@@ -1795,7 +1791,7 @@ mod any_value {
 
         type Error = ValueError;
 
-        fn serialize_element<T: serde::Serialize + ?Sized>(
+        fn serialize_element<T: Serialize + ?Sized>(
             &mut self,
             value: &T,
         ) -> Result<(), Self::Error> {
@@ -1816,7 +1812,7 @@ mod any_value {
 
         type Error = ValueError;
 
-        fn serialize_element<T: serde::Serialize + ?Sized>(
+        fn serialize_element<T: Serialize + ?Sized>(
             &mut self,
             value: &T,
         ) -> Result<(), Self::Error> {
@@ -1837,10 +1833,7 @@ mod any_value {
 
         type Error = ValueError;
 
-        fn serialize_field<T: serde::Serialize + ?Sized>(
-            &mut self,
-            value: &T,
-        ) -> Result<(), Self::Error> {
+        fn serialize_field<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<(), Self::Error> {
             if let Some(value) = value.serialize(ValueSerializer)? {
                 self.value.push(value);
             }
@@ -1858,10 +1851,7 @@ mod any_value {
 
         type Error = ValueError;
 
-        fn serialize_field<T: serde::Serialize + ?Sized>(
-            &mut self,
-            value: &T,
-        ) -> Result<(), Self::Error> {
+        fn serialize_field<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<(), Self::Error> {
             if let Some(value) = value.serialize(ValueSerializer)? {
                 self.value.push(value);
             }
@@ -1886,10 +1876,7 @@ mod any_value {
 
         type Error = ValueError;
 
-        fn serialize_key<T: serde::Serialize + ?Sized>(
-            &mut self,
-            key: &T,
-        ) -> Result<(), Self::Error> {
+        fn serialize_key<T: Serialize + ?Sized>(&mut self, key: &T) -> Result<(), Self::Error> {
             let key = match key.serialize(ValueSerializer)? {
                 Some(AnyValue::String(key)) => Key::from(String::from(key)),
                 key => Key::from(format!("{:?}", key)),
@@ -1900,10 +1887,7 @@ mod any_value {
             Ok(())
         }
 
-        fn serialize_value<T: serde::Serialize + ?Sized>(
-            &mut self,
-            value: &T,
-        ) -> Result<(), Self::Error> {
+        fn serialize_value<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<(), Self::Error> {
             let key = self
                 .key
                 .take()
@@ -1926,7 +1910,7 @@ mod any_value {
 
         type Error = ValueError;
 
-        fn serialize_field<T: serde::Serialize + ?Sized>(
+        fn serialize_field<T: Serialize + ?Sized>(
             &mut self,
             key: &'static str,
             value: &T,
@@ -1950,7 +1934,7 @@ mod any_value {
 
         type Error = ValueError;
 
-        fn serialize_field<T: serde::Serialize + ?Sized>(
+        fn serialize_field<T: Serialize + ?Sized>(
             &mut self,
             key: &'static str,
             value: &T,
