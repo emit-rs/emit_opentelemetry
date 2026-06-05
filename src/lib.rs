@@ -126,15 +126,13 @@ fn main() {
 
     let mut reporter = emit::metric::Reporter::new();
 
-    let rt = emit_opentelemetry::setup(logger_provider, tracer_provider)
-        .map_emitter(|emitter| {
-            // 2. Add `emit_opentelemetry`'s metrics to a reporter so we can see what it's up to
-            //    You can do this independently of the internal emitter
-            reporter.add_source(emitter.metric_source());
+    let setup = emit_opentelemetry::setup(logger_provider, tracer_provider);
 
-            emitter
-        })
-        .init();
+    // 2. Add `emit_opentelemetry`'s metrics to a reporter so we can see what it's up to
+    //    You can do this independently of the internal emitter
+    reporter.add_source(setup.metric_source());
+
+    let rt = setup.init();
 
     // Your app code goes here
 
@@ -215,10 +213,8 @@ fn main() {
         .build();
 
     let rt = emit_opentelemetry::setup(logger_provider, tracer_provider)
-        .map_emitter(|emitter| emitter
-            .with_log_body(|evt, f| write!(f, "{}", evt.tpl()))
-            .with_span_name(|evt, f| write!(f, "{}", evt.tpl()))
-        )
+        .with_log_body(|evt, f| write!(f, "{}", evt.tpl()))
+        .with_span_name(|evt, f| write!(f, "{}", evt.tpl()))
         .init();
 
     // Your app code goes here
@@ -239,8 +235,8 @@ where
     let name = "emit";
     let metrics = Arc::new(InternalMetrics::default());
 
-    Setup(
-        emit::setup()
+    Setup {
+        inner: emit::setup()
             .with_clock(emit::Empty)
             .with_rng(emit::Empty)
             .emit_to(OpenTelemetryEmitter::new(
@@ -251,26 +247,89 @@ where
             .map_ctxt(|ctxt| {
                 OpenTelemetryCtxt::wrap(metrics.clone(), tracer_provider.tracer(name), ctxt)
             }),
-    )
+        metrics,
+    }
 }
 
 /**
 A partly initialized OpenTelemetry provider.
 */
-pub struct Setup<L, T>(
-    emit::Setup<
+pub struct Setup<L, T> {
+    metrics: Arc<InternalMetrics>,
+    inner: emit::Setup<
         OpenTelemetryEmitter<L>,
         OpenTelemetryIsSampledFilter,
         OpenTelemetryCtxt<emit::setup::DefaultCtxt, T>,
         emit::Empty,
         emit::Empty,
     >,
-);
+}
 
 impl<L: Logger + Send + Sync + 'static, T: Tracer + Send + Sync + 'static> Setup<L, T>
 where
     T::Span: Send + Sync + 'static,
 {
+    /**
+    Specify a function that gets the name of a span from a diagnostic event.
+
+    The default implementation uses the [`KEY_SPAN_NAME`] property on the event, or [`emit::Event::msg`] if it's not present.
+    */
+    pub fn with_span_name(
+        mut self,
+        writer: impl Fn(
+            &emit::event::Event<&dyn emit::props::ErasedProps>,
+            &mut fmt::Formatter,
+        ) -> fmt::Result
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        Setup {
+            metrics: self.metrics,
+            inner: self.inner.map_emitter(|mut emitter| {
+                emitter.span_name = Box::new(writer);
+                emitter
+            }),
+        }
+    }
+
+    /**
+    Specify a function that gets the body of a log record from a diagnostic event.
+
+    The default implementation uses [`emit::Event::msg`].
+    */
+    pub fn with_log_body(
+        mut self,
+        writer: impl Fn(
+            &emit::event::Event<&dyn emit::props::ErasedProps>,
+            &mut fmt::Formatter,
+        ) -> fmt::Result
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        Setup {
+            metrics: self.metrics,
+            inner: self.inner.map_emitter(|mut emitter| {
+                emitter.log_body = Box::new(writer);
+                emitter
+            }),
+        }
+    }
+
+    /**
+    Get an [`emit::metric::Source`] for instrumentation produced by the `emit` to OpenTelemetry SDK integration.
+
+    These metrics are shared by [`OpenTelemetryCtxt::metric_source`].
+
+    These metrics can be used to monitor the running health of your diagnostic pipeline.
+    */
+    pub fn metric_source(&self) -> EmitOpenTelemetryMetrics {
+        EmitOpenTelemetryMetrics {
+            metrics: self.metrics.clone(),
+        }
+    }
+
     /**
     Initialize `emit`'s global runtime to forward to the OpenTelemetry SDK.
     */
@@ -281,7 +340,7 @@ where
         OpenTelemetryEmitter<L>,
         OpenTelemetryCtxt<emit::setup::DefaultCtxt, T>,
     > {
-        self.0.init()
+        self.inner.init()
     }
 
     /**
@@ -296,7 +355,7 @@ where
             OpenTelemetryCtxt<emit::setup::DefaultCtxt, T>,
         >,
     > {
-        self.0.try_init()
+        self.inner.try_init()
     }
 
     /**
@@ -310,7 +369,7 @@ where
         OpenTelemetryEmitter<L>,
         OpenTelemetryCtxt<emit::setup::DefaultCtxt, T>,
     > {
-        self.0.init_slot(slot)
+        self.inner.init_slot(slot)
     }
 
     /**
@@ -326,7 +385,7 @@ where
             OpenTelemetryCtxt<emit::setup::DefaultCtxt, T>,
         >,
     > {
-        self.0.try_init_slot(slot)
+        self.inner.try_init_slot(slot)
     }
 }
 
@@ -742,57 +801,6 @@ impl<L> OpenTelemetryEmitter<L> {
             span_name: default_span_name(),
             log_body: default_log_body(),
             metrics,
-        }
-    }
-
-    /**
-    Specify a function that gets the name of a span from a diagnostic event.
-
-    The default implementation uses the [`KEY_SPAN_NAME`] property on the event, or [`emit::Event::msg`] if it's not present.
-    */
-    pub fn with_span_name(
-        mut self,
-        writer: impl Fn(
-                &emit::event::Event<&dyn emit::props::ErasedProps>,
-                &mut fmt::Formatter,
-            ) -> fmt::Result
-            + Send
-            + Sync
-            + 'static,
-    ) -> Self {
-        self.span_name = Box::new(writer);
-        self
-    }
-
-    /**
-    Specify a function that gets the body of a log record from a diagnostic event.
-
-    The default implementation uses [`emit::Event::msg`].
-    */
-    pub fn with_log_body(
-        mut self,
-        writer: impl Fn(
-                &emit::event::Event<&dyn emit::props::ErasedProps>,
-                &mut fmt::Formatter,
-            ) -> fmt::Result
-            + Send
-            + Sync
-            + 'static,
-    ) -> Self {
-        self.log_body = Box::new(writer);
-        self
-    }
-
-    /**
-    Get an [`emit::metric::Source`] for instrumentation produced by the `emit` to OpenTelemetry SDK integration.
-
-    These metrics are shared by [`OpenTelemetryCtxt::metric_source`].
-
-    These metrics can be used to monitor the running health of your diagnostic pipeline.
-    */
-    pub fn metric_source(&self) -> EmitOpenTelemetryMetrics {
-        EmitOpenTelemetryMetrics {
-            metrics: self.metrics.clone(),
         }
     }
 }
