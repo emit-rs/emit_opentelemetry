@@ -22,14 +22,14 @@ version = "1"
 
 # add `emit_openetelemetry` with the same major/minor as the OpenTelemetry SDK
 [dependencies.emit_opentelemetry]
-version = "0.31"
+version = "0.32"
 
 [dependencies.opentelemetry_sdk]
-version = "0.31"
+version = "0.32"
 features = ["trace", "logs"]
 
 [dependencies.opentelemetry]
-version = "0.31"
+version = "0.32"
 features = ["trace", "logs"]
 ```
 
@@ -89,3 +89,10 @@ For more details on how to use `emit` once you've initialized it, see [the guide
 ## Versioning and compatibility
 
 `emit_opentelemetry` version `x.y.z` is compatible with `opentelemetry_sdk` version `x.y.*`.
+
+## Limitations
+
+The OpenTelemetry SDK's design imposes significant limitations on how other frameworks can integrate with it. For `emit` this means:
+
+- Traces must be started by the OpenTelemetry SDK using its configured sampler. Any `emit` spans created outside an active sampled OpenTelemetry trace will be discarded.
+- Any trace/span ids assigned by `emit` will be ignored, and assigned by the OpenTelemetry SDK instead. The trace/span ids exposed through `emit`'s context will reflect what's in the OpenTelemetry context.
