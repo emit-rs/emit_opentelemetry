@@ -39,6 +39,8 @@ async fn main() {
     let _ = emit_opentelemetry::setup(logger_provider.clone(), tracer_provider.clone()).init();
 
     // Run our example program
+    // IMPORTANT: Traces must be started through the OpenTelemetry SDK. `emit`'s integration
+    // discards any of its own `#[span]` events unless there's already an OpenTelemetry trace active.
     run_opentelemetry(tracer_provider.clone());
 
     // Shutdown the SDK
