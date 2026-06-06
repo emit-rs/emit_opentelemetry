@@ -1,7 +1,7 @@
 /*!
 This example demonstrates configuring `emit` to forward its events through the OpenTelemetry SDK.
 
-This is useful if you're already using the OpenTelemtry SDK, or if your application uses multiple frameworks.
+This is useful if you're already using the OpenTelemetry SDK, or if your application uses multiple frameworks.
 */
 
 use opentelemetry_otlp::WithTonicConfig as _;

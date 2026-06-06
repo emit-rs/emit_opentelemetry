@@ -18,14 +18,14 @@ version = "1"
 
 # add `emit_opentelemetry` with the same major/minor as the OpenTelemetry SDK
 [dependencies.emit_opentelemetry]
-version = "0.31"
+version = "0.32"
 
 [dependencies.opentelemetry_sdk]
-version = "0.31"
+version = "0.32"
 features = ["trace", "logs"]
 
 [dependencies.opentelemetry]
-version = "0.31"
+version = "0.32"
 features = ["trace", "logs"]
 ```
 

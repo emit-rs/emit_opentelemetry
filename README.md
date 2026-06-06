@@ -51,6 +51,10 @@ fn main() {
     let rt = emit_opentelemetry::setup(logger_provider, tracer_provider).init();
 
     // Your app code goes here
+    
+    // IMPORTANT: Traces need to be started through the OpenTelemetry SDK
+    // Functions annotated with `#[emit::span]` only produce spans if they're
+    // already in a sampled trace
 
     rt.blocking_flush(std::time::Duration::from_secs(30));
 
