@@ -275,7 +275,7 @@ where
     The default implementation uses the [`KEY_SPAN_NAME`] property on the event, or [`emit::Event::msg`] if it's not present.
     */
     pub fn with_span_name(
-        mut self,
+        self,
         writer: impl Fn(
                 &emit::event::Event<&dyn emit::props::ErasedProps>,
                 &mut fmt::Formatter,
@@ -299,7 +299,7 @@ where
     The default implementation uses [`emit::Event::msg`].
     */
     pub fn with_log_body(
-        mut self,
+        self,
         writer: impl Fn(
                 &emit::event::Event<&dyn emit::props::ErasedProps>,
                 &mut fmt::Formatter,
@@ -423,19 +423,6 @@ impl<C, T> OpenTelemetryCtxt<C, T> {
             tracer,
             inner: ctxt,
             metrics,
-        }
-    }
-
-    /**
-    Get an [`emit::metric::Source`] for instrumentation produced by the `emit` to OpenTelemetry SDK integration.
-
-    These metrics are shared by [`OpenTelemetryEmitter::metric_source`].
-
-    These metrics can be used to monitor the running health of your diagnostic pipeline.
-    */
-    pub fn metric_source(&self) -> EmitOpenTelemetryMetrics {
-        EmitOpenTelemetryMetrics {
-            metrics: self.metrics.clone(),
         }
     }
 }
@@ -689,15 +676,14 @@ where
         })
         .unwrap_or(SpanKind::Internal);
 
-    // TODO: `emit::Str::into_cow`
-    let span_name = span_name.map(|name| name.to_cow());
+    let span_name = span_name.map(|name| name.into_cow());
 
     // If the props include a span name then don't change it when completing the span
     // We need to track this in our own frame type because the OTel SDK doesn't expose
     // the name after construction
     let update_default_name_on_close = span_name.is_none();
 
-    let mut span = tracer
+    let span = tracer
         .span_builder(span_name.unwrap_or(Cow::Borrowed("emit_span")))
         .with_kind(span_kind);
 
@@ -873,11 +859,10 @@ impl<L: Logger> emit::Emitter for OpenTelemetryEmitter<L> {
                                 // is different from what we saw on construction. If it is the
                                 // same then they'll both be `&'static str`, which is cheap to
                                 // re-assign
-                                // TODO: `emit::Str::into_cow`
                                 span.update_name(
                                     v.by_ref()
                                         .cast::<emit::Str>()
-                                        .map(|v| v.to_cow())
+                                        .map(|v| v.into_cow())
                                         .unwrap_or_else(|| Cow::Owned(v.to_string())),
                                 );
                                 frame.options.update_default_name_on_close = false;
@@ -2039,8 +2024,6 @@ mod tests {
 
     use emit::runtime::AmbientSlot;
 
-    use opentelemetry::trace::TraceState;
-
     use opentelemetry_sdk::trace::Sampler;
     use opentelemetry_sdk::{
         logs::{in_memory_exporter::InMemoryLogExporter, SdkLoggerProvider},
@@ -2198,7 +2181,7 @@ mod tests {
     #[test]
     fn emit_span() {
         static SLOT: AmbientSlot = AmbientSlot::new();
-        let (_, spans, _, tracer_provider) = build(&SLOT);
+        let (_, spans, _, _) = build(&SLOT);
 
         // Spans outside sampled traces are ignored
         let ctxt = emit_span!(SLOT, |ctxt| ctxt);
@@ -2242,7 +2225,7 @@ mod tests {
         static SLOT: AmbientSlot = AmbientSlot::new();
         let (_, spans, _, tracer_provider) = build(&SLOT);
 
-        let ctxt = otel_span(&tracer_provider, |_| emit_span!(SLOT, |_| {}));
+        otel_span(&tracer_provider, |_| emit_span!(SLOT, |_| {}));
 
         let spans = spans.get_finished_spans().unwrap();
 
@@ -2252,11 +2235,30 @@ mod tests {
     }
 
     #[test]
+    fn otel_span_emit_span_name_control_param() {
+        static SLOT: AmbientSlot = AmbientSlot::new();
+        let (_, spans, _, tracer_provider) = build(&SLOT);
+
+        otel_span(&tracer_provider, |_| {
+            #[emit::span(rt: SLOT.get(), name: "custom", "emit span")]
+            fn emit_span() {}
+
+            emit_span();
+        });
+
+        let spans = spans.get_finished_spans().unwrap();
+
+        assert_eq!(2, spans.len());
+
+        assert_eq!("custom", spans[0].name);
+    }
+
+    #[test]
     fn otel_span_emit_span_name_guard_props() {
         static SLOT: AmbientSlot = AmbientSlot::new();
         let (_, spans, _, tracer_provider) = build(&SLOT);
 
-        let ctxt = otel_span(&tracer_provider, |_| {
+        otel_span(&tracer_provider, |_| {
             #[emit::span(rt: SLOT.get(), guard: span, "emit span")]
             fn emit_span() {
                 let _span = span.with_name("custom");
@@ -2277,7 +2279,7 @@ mod tests {
         static SLOT: AmbientSlot = AmbientSlot::new();
         let (_, spans, _, tracer_provider) = build(&SLOT);
 
-        let ctxt = otel_span(&tracer_provider, |_| {
+        otel_span(&tracer_provider, |_| {
             #[emit::span(rt: SLOT.get(), "emit span", span_kind: "client")]
             fn emit_span() {}
 
@@ -2296,7 +2298,7 @@ mod tests {
         static SLOT: AmbientSlot = AmbientSlot::new();
         let (_, spans, _, tracer_provider) = build(&SLOT);
 
-        let ctxt = otel_span(&tracer_provider, |_| {
+        otel_span(&tracer_provider, |_| {
             #[emit::span(rt: SLOT.get(), evt_props: ("span_kind", "client"), "emit span")]
             fn emit_span() {}
 
@@ -2311,13 +2313,78 @@ mod tests {
     }
 
     #[test]
-    fn otel_span_emit_span_links() {
-        todo!()
+    fn otel_span_emit_span_links_guard_props() {
+        static SLOT: AmbientSlot = AmbientSlot::new();
+        let (_, spans, _, tracer_provider) = build(&SLOT);
+
+        otel_span(&tracer_provider, |_| {
+            #[emit::span(rt: SLOT.get(), guard: span, "emit span")]
+            fn emit_span() {
+                let _span = span.push_prop(
+                    "span_links",
+                    ["4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7"],
+                );
+            }
+
+            emit_span();
+        });
+
+        let spans = spans.get_finished_spans().unwrap();
+
+        assert_eq!(2, spans.len());
+
+        assert_eq!(1, spans[0].links.links.len());
+
+        assert_eq!(
+            "4bf92f3577b34da6a3ce929d0e0e4736",
+            spans[0].links.links[0].span_context.trace_id().to_string()
+        );
+        assert_eq!(
+            "00f067aa0ba902b7",
+            spans[0].links.links[0].span_context.span_id().to_string()
+        );
     }
 
     #[test]
-    fn otel_span_emit_span_err() {
-        todo!()
+    fn otel_span_emit_span_ok_control_param() {
+        static SLOT: AmbientSlot = AmbientSlot::new();
+        let (_, spans, _, tracer_provider) = build(&SLOT);
+
+        otel_span(&tracer_provider, |_| {
+            #[emit::span(rt: SLOT.get(), ok_lvl: "info", "emit span")]
+            fn emit_span() -> Result<(), io::Error> {
+                Ok(())
+            }
+
+            let _ = emit_span();
+        });
+
+        let spans = spans.get_finished_spans().unwrap();
+
+        assert_eq!(2, spans.len());
+
+        assert_eq!(Status::Ok, spans[0].status);
+    }
+
+    #[test]
+    fn otel_span_emit_span_err_control_param() {
+        static SLOT: AmbientSlot = AmbientSlot::new();
+        let (_, spans, _, tracer_provider) = build(&SLOT);
+
+        otel_span(&tracer_provider, |_| {
+            #[emit::span(rt: SLOT.get(), ok_lvl: "info", "emit span")]
+            fn emit_span() -> Result<(), io::Error> {
+                Err(io::Error::new(io::ErrorKind::Other, "something failed!"))
+            }
+
+            let _ = emit_span();
+        });
+
+        let spans = spans.get_finished_spans().unwrap();
+
+        assert_eq!(2, spans.len());
+
+        assert_eq!(Status::error("something failed!"), spans[0].status);
     }
 
     #[test]
