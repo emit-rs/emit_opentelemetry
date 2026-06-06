@@ -333,6 +333,7 @@ where
     /**
     Initialize `emit`'s global runtime to forward to the OpenTelemetry SDK.
     */
+    #[cfg(feature = "implicit_rt")]
     pub fn init(self) -> emit::setup::Init<'static, impl emit::Emitter, impl emit::Ctxt> {
         self.inner.init()
     }
@@ -340,6 +341,7 @@ where
     /**
     Try to initialize `emit`'s global runtime to forward to the OpenTelemetry SDK.
     */
+    #[cfg(feature = "implicit_rt")]
     pub fn try_init(
         self,
     ) -> Option<emit::setup::Init<'static, impl emit::Emitter, impl emit::Ctxt>> {

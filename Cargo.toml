@@ -16,6 +16,10 @@ members = [
     "examples/multi_framework",
 ]
 
+[features]
+default = ["implicit_rt"]
+implicit_rt = ["emit/implicit_rt"]
+
 [dependencies.emit]
 version = "1"
 features = ["std", "serde", "implicit_internal_rt"]
