@@ -16,9 +16,12 @@ async fn main() {
 
     let otelcol = OtelCol::spawn("config");
 
+    // Give the collector time to stand up
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
     // Configure the OpenTelemetry SDK
     // In this example, we're configuring it to produce OTLP
-    let channel = tonic::transport::Channel::from_static("http://localhost:4319")
+    let channel = tonic::transport::Channel::from_static("http://localhost:44319")
         .connect()
         .await
         .unwrap();
