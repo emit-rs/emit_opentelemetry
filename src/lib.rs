@@ -14,7 +14,7 @@ Configure the OpenTelemetry SDK as per its documentation, then add `emit` and `e
 
 ```toml
 [dependencies.emit]
-version = "1"
+version = "2"
 
 # add `emit_opentelemetry` with the same major/minor as the OpenTelemetry SDK
 [dependencies.emit_opentelemetry]
@@ -236,7 +236,7 @@ where
     let metrics = Arc::new(InternalMetrics::default());
 
     Setup {
-        inner: emit::setup()
+        inner: emit1::setup()
             .with_clock(emit::Empty)
             .with_rng(emit::Empty)
             .emit_to(OpenTelemetryEmitter::new(
@@ -256,10 +256,10 @@ A partly initialized OpenTelemetry provider.
 */
 pub struct Setup<L, T> {
     metrics: Arc<InternalMetrics>,
-    inner: emit::Setup<
+    inner: emit1::Setup<
         OpenTelemetryEmitter<L>,
         OpenTelemetryIncomingFilter,
-        OpenTelemetryCtxt<emit::setup::DefaultCtxt, T>,
+        OpenTelemetryCtxt<emit1::setup::DefaultCtxt, T>,
         emit::Empty,
         emit::Empty,
     >,
@@ -334,7 +334,7 @@ where
     Initialize `emit`'s global runtime to forward to the OpenTelemetry SDK.
     */
     #[cfg(feature = "implicit_rt")]
-    pub fn init(self) -> emit::setup::Init<'static, impl emit::Emitter, impl emit::Ctxt> {
+    pub fn init(self) -> emit1::setup::Init<'static, impl emit::Emitter, impl emit::Ctxt> {
         self.inner.init()
     }
 
@@ -344,7 +344,7 @@ where
     #[cfg(feature = "implicit_rt")]
     pub fn try_init(
         self,
-    ) -> Option<emit::setup::Init<'static, impl emit::Emitter, impl emit::Ctxt>> {
+    ) -> Option<emit1::setup::Init<'static, impl emit::Emitter, impl emit::Ctxt>> {
         self.inner.try_init()
     }
 
@@ -354,7 +354,7 @@ where
     pub fn init_slot<'a>(
         self,
         slot: &'a AmbientSlot,
-    ) -> emit::setup::Init<'a, impl emit::Emitter, impl emit::Ctxt> {
+    ) -> emit1::setup::Init<'a, impl emit::Emitter, impl emit::Ctxt> {
         self.inner.init_slot(slot)
     }
 
@@ -364,7 +364,7 @@ where
     pub fn try_init_slot<'a>(
         self,
         slot: &'a AmbientSlot,
-    ) -> Option<emit::setup::Init<'a, impl emit::Emitter, impl emit::Ctxt>> {
+    ) -> Option<emit1::setup::Init<'a, impl emit::Emitter, impl emit::Ctxt>> {
         self.inner.try_init_slot(slot)
     }
 }
@@ -2207,9 +2207,9 @@ mod tests {
             // an otel span with the same span context
             emit::emit!(rt: SLOT.get(), evt: emit::Span::new(
                 emit::mdl!(),
-                "emit span",
                 emit::Empty,
                 emit::props! {
+                    span_name: "emit span",
                     trace_id: emit_trace_id(cx.span().span_context().trace_id()),
                     span_parent: emit_span_id(cx.span().span_context().span_id()),
                     span_id: "00f067aa0ba902b7",
