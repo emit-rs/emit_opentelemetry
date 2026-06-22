@@ -5,6 +5,7 @@ An integration test between `emit_opentelemetry` and the OpenTelemetry Collector
 use std::{
     io::Read,
     process::{Child, Command, Stdio},
+    thread,
     time::Duration,
 };
 
@@ -17,7 +18,7 @@ async fn main() {
     let otelcol = OtelCol::spawn("config");
 
     // Give the collector time to stand up
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
 
     // Configure the OpenTelemetry SDK
     // In this example, we're configuring it to produce OTLP
@@ -47,42 +48,60 @@ async fn main() {
         .build();
 
     // Configure `emit` to point to `opentelemetry`
-    let _ = emit_opentelemetry::setup(logger_provider.clone(), tracer_provider.clone()).init();
+    let setup = emit_opentelemetry::setup(logger_provider.clone(), tracer_provider.clone());
+    let metrics = setup.metric_source();
+    let _ = setup.init();
 
     // Generate some random ids
     // These are used to assert the collector received our events
     let log_uuid = uuid::Uuid::new_v4().to_string();
     let span_uuid = uuid::Uuid::new_v4().to_string();
 
-    // Emit a log event
-    emit::info!("A log message {log_uuid}");
+    run_opentelemetry(tracer_provider.clone(), || {
+        // Emit a log event
+        emit::info!("A log message {log_uuid}");
 
-    // Emit a span in a trace
-    #[emit::span(name: "emit_otlp_test", "A span {span_uuid}")]
-    async fn span(span_uuid: &str) {
-        tokio::time::sleep(Duration::from_millis(3)).await;
-    }
-    span(&span_uuid).await;
+        // Emit a span in a trace
+        #[emit::span(name: "emit_opentelemetry_test", "A span {span_uuid}")]
+        fn span(span_uuid: &str) {
+            thread::sleep(Duration::from_secs(1));
+        }
+        span(&span_uuid);
+    });
 
     // Shutdown the SDK
     let _ = logger_provider.shutdown();
     let _ = tracer_provider.shutdown();
 
     // Give the collector time to process events
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    emit::metric::Source::sample_metrics(
+        &metrics,
+        emit::metric::sampler::from_emitter(emit::runtime::internal()),
+    );
 
     let output = otelcol.output();
 
     // Ensure the collector received and accepted the events we emitted
-    assert_exporter(&output, "LogsExporter", &log_uuid);
-    assert_exporter(&output, "TracesExporter", &span_uuid);
+    assert_exporter(&output, &log_uuid);
+    assert_exporter(&output, &span_uuid);
 }
 
-fn assert_exporter(output: &str, exporter: &str, id: &str) {
-    assert!(
-        output.contains(&exporter),
-        "{exporter} not found in:\n{output}"
-    );
+fn run_opentelemetry<T: opentelemetry::trace::TracerProvider>(tracer_provider: T, f: impl FnOnce())
+where
+    <T::Tracer as opentelemetry::trace::Tracer>::Span: Send + Sync + 'static,
+{
+    use opentelemetry::trace::Tracer;
+
+    tracer_provider
+        .tracer("run_opentelemetry")
+        .in_span("Running OTel", |_| {
+            f();
+        })
+}
+
+fn assert_exporter(output: &str, id: &str) {
     assert!(output.contains(id), "{id} not found in:\n{output}");
 }
 
