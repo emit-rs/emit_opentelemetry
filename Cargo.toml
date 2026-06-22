@@ -14,15 +14,22 @@ edition = "2021"
 members = [
     "examples/getting_started",
     "examples/multi_framework",
+    "test/integration",
 ]
 
 [features]
 default = ["implicit_rt"]
-implicit_rt = ["emit/implicit_rt"]
+implicit_rt = ["emit/implicit_rt", "emit1/implicit_rt"]
 
 [dependencies.emit]
-version = "1"
+version = "2"
 features = ["std", "serde", "implicit_internal_rt"]
+default-features = false
+
+[dependencies.emit1]
+version = "1"
+package = "emit"
+features = ["std"]
 default-features = false
 
 [dependencies.opentelemetry_sdk]
@@ -37,7 +44,7 @@ features = ["logs", "trace"]
 version = "1"
 
 [dev-dependencies.emit]
-version = "1.8"
+version = "2"
 features = ["implicit_rt"]
 
 [dev-dependencies.opentelemetry_sdk]

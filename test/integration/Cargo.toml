@@ -1,0 +1,37 @@
+[package]
+name = "emit_oopentelemetry_test_integration"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[dependencies.emit]
+version = "2"
+
+[dependencies.emit_term]
+version = "2"
+
+[dependencies.emit_opentelemetry]
+path = "../../"
+
+[dependencies.opentelemetry_sdk]
+version = "0.32"
+features = ["rt-tokio", "trace", "logs"]
+
+[dependencies.opentelemetry]
+version = "0.32"
+features = ["trace", "logs"]
+
+[dependencies.opentelemetry-otlp]
+version = "0.32"
+features = ["trace", "logs", "grpc-tonic", "gzip-tonic"]
+
+[dependencies.tonic]
+version = "0.14"
+
+[dependencies.tokio]
+version = "1"
+features = ["rt", "macros", "rt-multi-thread"]
+
+[dependencies.uuid]
+version = "1"
+features = ["v4"]

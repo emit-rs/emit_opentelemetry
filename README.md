@@ -18,7 +18,7 @@ Configure the OpenTelemetry SDK as per its documentation, then add `emit` and `e
 
 ```toml
 [dependencies.emit]
-version = "1"
+version = "2"
 
 # add `emit_openetelemetry` with the same major/minor as the OpenTelemetry SDK
 [dependencies.emit_opentelemetry]

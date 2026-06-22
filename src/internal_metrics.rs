@@ -23,11 +23,11 @@ macro_rules! metrics {
         }
 
         impl $internal_container {
-            pub fn sample(&self) -> impl Iterator<Item = emit::metric::Metric<'static, emit::empty::Empty>> + 'static {
+            pub fn sample1(&self) -> impl Iterator<Item = emit1::metric::Metric<'static, emit::empty::Empty>> + 'static {
                 let $internal_container { $($metric),* } = self;
 
                 [$(
-                    emit::metric::Metric::new(
+                    emit1::metric::Metric::new(
                         emit::pkg!(),
                         stringify!($metric),
                         <$ty>::AGG,
@@ -37,6 +37,24 @@ macro_rules! metrics {
                     ),
                 )*]
                 .into_iter()
+            }
+        }
+
+        impl emit::metric::Source for $internal_container {
+            fn sample_metrics<S: emit::metric::Sampler>(&self, sampler: S) {
+                let $internal_container { $($metric),* } = self;
+
+                $(
+                    sampler.metric(emit::metric::Metric::new(
+                        emit::pkg!(),
+                        emit::Empty,
+                        emit::props! {
+                            metric_name: stringify!($metric),
+                            metric_agg: <$ty>::AGG,
+                            metric_value: $metric.sample(),
+                        },
+                    ));
+                )*
             }
         }
 
@@ -100,10 +118,16 @@ pub struct EmitOpenTelemetryMetrics {
     pub(crate) metrics: Arc<InternalMetrics>,
 }
 
-impl emit::metric::Source for EmitOpenTelemetryMetrics {
-    fn sample_metrics<S: emit::metric::sampler::Sampler>(&self, sampler: S) {
-        for metric in self.metrics.sample() {
+impl emit1::metric::Source for EmitOpenTelemetryMetrics {
+    fn sample_metrics<S: emit1::metric::sampler::Sampler>(&self, sampler: S) {
+        for metric in self.metrics.sample1() {
             sampler.metric(metric);
         }
+    }
+}
+
+impl emit::metric::Source for EmitOpenTelemetryMetrics {
+    fn sample_metrics<S: emit::metric::Sampler>(&self, sampler: S) {
+        self.metrics.sample_metrics(sampler)
     }
 }
