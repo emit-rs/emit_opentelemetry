@@ -36,6 +36,8 @@ features = ["trace", "logs"]
 Initialize `emit` to send diagnostics to the OpenTelemetry SDK using the `emit_opentelemetry::setup` function:
 
 ```rust
+use opentelemetry::trace::{Tracer as _, TracerProvider as _};
+
 fn main() {
     // Configure the OpenTelemetry SDK
     // See the OpenTelemetry SDK docs for details on configuration
@@ -48,13 +50,16 @@ fn main() {
         .build();
 
     // Configure `emit` to point to the OpenTelemetry SDK
-    let rt = emit_opentelemetry::setup(logger_provider, tracer_provider).init();
-
-    // Your app code goes here
+    let rt = emit_opentelemetry::setup(logger_provider.clone(), tracer_provider.clone()).init();
     
     // IMPORTANT: Traces need to be started through the OpenTelemetry SDK
     // Functions annotated with `#[emit::span]` only produce spans if they're
     // already in a sampled trace
+    tracer_provider
+        .tracer("main")
+        .in_span("Running main", |_| {
+            // Your app code goes here
+        });
 
     rt.blocking_flush(std::time::Duration::from_secs(30));
 

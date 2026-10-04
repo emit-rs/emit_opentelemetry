@@ -112,7 +112,7 @@ Metrics produced by the `emit` to the OpenTelemetry SDK integration itself.
 
 This type doesn't collect any OTLP metrics you emit, it includes metrics about this library's own activity.
 
-You can enumerate the metrics using the [`emit::metric::Source`] implementation. See [`emit::metric`] for details.
+You can enumerate the metrics using the [`emit::metric::Source`] implementation. See [`mod@emit::metric`] for details.
 */
 pub struct EmitOpenTelemetryMetrics {
     pub(crate) metrics: Arc<InternalMetrics>,
