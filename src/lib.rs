@@ -32,6 +32,8 @@ features = ["trace", "logs"]
 Initialize `emit` to send diagnostics to the OpenTelemetry SDK using [`setup`]:
 
 ```
+use opentelemetry::trace::{Tracer as _, TracerProvider as _};
+
 fn main() {
     // Configure the OpenTelemetry SDK
     // See the OpenTelemetry SDK docs for details on configuration
@@ -44,15 +46,23 @@ fn main() {
         .build();
 
     // Configure `emit` to point to the OpenTelemetry SDK
-    let rt = emit_opentelemetry::setup(logger_provider, tracer_provider).init();
+    let rt = emit_opentelemetry::setup(logger_provider.clone(), tracer_provider.clone()).init();
 
-    // Your app code goes here
+    // Traces must be started by the OpenTelemetry SDK.
+    // `emit` will only produce spans that are inside sampled OpenTelemetry traces
+    tracer_provider
+        .tracer("main")
+        .in_span("Running main", |_| {
+            // Your app code goes here
+        });
 
     rt.blocking_flush(std::time::Duration::from_secs(30));
 
     // Shutdown the OpenTelemetry SDK
 }
 ```
+
+> **⚠️ IMPORTANT:** Traces must be started by the OpenTelemetry SDK. `emit` will only produce spans if they're inside an already sampled OpenTelemetry trace.
 
 Diagnostic events produced by the [`macro@emit::span`] macro are sent to an [`opentelemetry::trace::Tracer`] as an [`opentelemetry::trace::Span`] on completion.
 All other emitted events are sent to an [`opentelemetry::logs::Logger`] as [`opentelemetry::logs::LogRecord`]s.
@@ -319,8 +329,6 @@ where
 
     /**
     Get an [`emit::metric::Source`] for instrumentation produced by the `emit` to OpenTelemetry SDK integration.
-
-    These metrics are shared by [`OpenTelemetryCtxt::metric_source`].
 
     These metrics can be used to monitor the running health of your diagnostic pipeline.
     */
